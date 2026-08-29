@@ -93,6 +93,19 @@ def start_here(manifest: dict[str, Any], quality: dict[str, Any] | None) -> str:
     ca = manifest["corporate_actions"]
     gb = manifest["total_bytes"] / 1e9
 
+    without_csv = manifest.get("csv_policy", {}).get("years_without_csv", {})
+    missing_csv = {k: v for k, v in without_csv.items() if v}
+    if missing_csv:
+        parts = ", ".join(
+            f"`{name}` {', '.join(str(y) for y in years)}" for name, years in missing_csv.items()
+        )
+        csv_status = (
+            f"**In this copy of the dataset, these years have no CSV: {parts}.** Their Parquet "
+            "files are complete and are the authoritative data."
+        )
+    else:
+        csv_status = "In this copy, every year has both a Parquet file and a CSV."
+
     quality_line = (
         "See `DATA_QUALITY_REPORT.md` for the full verification run."
         if quality
@@ -274,6 +287,19 @@ The Parquet and CSV files for a given year hold **the same rows and the same val
 not a claim of intent; it is checked on every publish with a full set difference in both
 directions, and the publish is aborted if it fails.
 
+### If a year has no CSV
+
+{csv_status}
+
+Every year always has a Parquet file. A year may legitimately have **no CSV**: the CSV is a
+convenience mirror about ten times the size of the Parquet for the same rows, and deleting
+CSVs to free disk space is supported and expected. The engine will not recreate a deleted CSV
+for a past year — that would silently undo the space you freed — and it will not stop because
+one is missing.
+
+`MANIFEST.json` lists exactly which years have no CSV, under `csv_policy.years_without_csv`.
+To get one back, delete that year's Parquet file too; the next run rebuilds both.
+
 ## 8. Verifying integrity
 
 `MANIFEST.json` carries a SHA256 for every file. To check them all:
@@ -294,8 +320,10 @@ Run it from inside this folder.
    dropped.
 7. **Do not assume `nifty750` is an index.** It is not. See section 3.
 8. **Do not assume a stale-looking last date means the data is broken.** See section 10.
+9. **Do not assume a missing CSV means missing data.** The Parquet is the dataset. See
+   section 7.
 
-## 10. How this stays current
+## 10. How this stays current, and what it survives
 
 An engine on the owner's laptop updates this folder automatically. It fetches every trading
 session it has not yet certified — if the laptop was off for a month, the next run catches up
@@ -303,6 +331,22 @@ all of it unattended, then republishes and updates `MANIFEST.json` and `CHANGELO
 
 So a last date a few days behind today is normal and self-correcting. `CHANGELOG.md` shows
 when each publish happened.
+
+It also repairs this folder. On every run:
+
+| What is wrong | What happens |
+|---|---|
+| A Parquet file is missing or corrupt | Rebuilt from the engine's working store |
+| A CSV for a past year is missing | **Left missing on purpose.** See section 7 |
+| A CSV for the current year is missing | Rewritten, so new data always has one |
+| Both files for a year are missing | Both rebuilt — this is a real gap, not a disk decision |
+| `MANIFEST.json` is missing or unreadable | Rebuilt from what is on disk |
+| The documentation files are missing | Regenerated |
+| This whole folder is deleted | Entirely rebuilt on the next run |
+| The engine cannot reach NSE | The run stops and **this folder is left untouched** |
+
+The last row is the important one. A failed run never leaves a half-written dataset behind:
+what you are reading is always the last version that passed every check.
 
 ## 11. Honest limitations
 

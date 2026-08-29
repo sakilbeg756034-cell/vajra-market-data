@@ -58,6 +58,13 @@ N750_DEFINITION = (
 # round-trip to identical values. Every other text column already uses NULL.
 EMPTY_STRING_COLUMNS = ("CorporateActionQuarantineReason",)
 
+# Why a year can legitimately have no CSV. See _write_year.
+CSV_DELETED_REASON = (
+    "CSV_REMOVED_BY_OPERATOR_TO_SAVE_DISK_NOT_BACKFILLED - the Parquet for this year is complete; "
+    "the CSV mirror was deleted and is deliberately not recreated. Read the Parquet, or delete "
+    "the Parquet too and the next run will rebuild both."
+)
+
 
 # --------------------------------------------------------------------------- atomic writes
 
@@ -188,12 +195,32 @@ def _write_year(
     spec: YearSource,
     root: Path,
     previous: dict[str, dict[str, Any]] | None = None,
+    *,
+    active_year: int | None = None,
 ) -> dict[str, Any]:
-    """Write one year as Parquet and CSV, then prove the two hold identical data.
+    """Write one year, self-healing whatever is missing or damaged.
 
-    Seventeen of the eighteen years never change. If the source file's hash is unchanged and
-    both published files still match their recorded hashes, the year is reused as-is: a daily
-    run then touches only the current year instead of rewriting 4 GB every morning.
+    Three things can be true of a published year, and each gets a different response.
+
+    **The Parquet is the dataset.** If it is missing or its hash does not match what the
+    manifest recorded, it is rebuilt from the store, no questions asked. Deleting one - by
+    accident or otherwise - costs nothing but the time to write it again.
+
+    **The CSV is a convenience mirror, and its absence can be deliberate.** The operator
+    deletes CSV files when the laptop runs short of disk; they are roughly ten times the size
+    of the Parquet for the same rows. Re-creating seventeen years of them on the next run
+    would silently undo that. So a year whose **Parquet is present but whose CSV is not** is
+    read as a deliberate deletion and left alone.
+
+    **Both missing means a real gap**, not a disk-space decision, so both are rebuilt. That is
+    what happens when the whole published folder is deleted: everything comes back.
+
+    The one exception is the year currently being appended to. New data always gets a CSV, so
+    that after a CSV wipe the engine resumes writing them from that day forward rather than
+    stopping for good.
+
+    Seventeen of the eighteen years never change, so an untouched year is reused rather than
+    rewritten: a daily run touches the current year and nothing else.
     """
     universe_dir = root / spec.universe
     parquet_path = universe_dir / "parquet" / f"{spec.universe}_{spec.year}.parquet"
@@ -203,34 +230,58 @@ def _write_year(
 
     source_hash = sha256_file(spec.source)
     prior = (previous or {}).get(f"{spec.universe}:{spec.year}")
-    if (
-        prior
+    is_active = active_year is not None and spec.year >= active_year
+
+    parquet_ok = parquet_path.is_file() and (
+        prior is None or sha256_file(parquet_path) == prior.get("parquet", {}).get("sha256")
+    )
+    csv_exists = csv_path.is_file()
+    csv_ok = csv_exists and (
+        prior is None
+        or not prior.get("csv")
+        or sha256_file(csv_path) == prior["csv"]["sha256"]
+    )
+
+    # A deliberate CSV deletion: the data is intact, only the mirror is gone.
+    csv_intentionally_absent = parquet_path.is_file() and not csv_exists and not is_active
+    write_csv = not csv_intentionally_absent
+
+    unchanged = (
+        prior is not None
         and prior.get("source_sha256") == source_hash
-        and parquet_path.is_file()
-        and csv_path.is_file()
-        and sha256_file(parquet_path) == prior["parquet"]["sha256"]
-        and sha256_file(csv_path) == prior["csv"]["sha256"]
-    ):
+        and parquet_ok
+        and (csv_ok or csv_intentionally_absent)
+    )
+    if unchanged:
         reused = dict(prior)
         reused["reused_unchanged"] = True
         # Labels are computed, not stored data: recompute in case the rule changed.
         label, basis = year_label(spec.universe, spec.year)
         reused["label"] = label
         reused["membership_basis"] = basis
+        if csv_intentionally_absent:
+            reused.pop("csv", None)
+            reused["csv_present"] = False
+            reused["csv_absent_reason"] = CSV_DELETED_REASON
         return reused
 
     select = _normalised_select(connection, spec.source)
 
     parquet_tmp = parquet_path.with_name(f".{parquet_path.name}.{uuid4().hex}.partial")
-    csv_tmp = csv_path.with_name(f".{csv_path.name}.{uuid4().hex}.partial")
     connection.execute(
         f"COPY ({select}) TO '{_sql(parquet_tmp)}' (FORMAT PARQUET, COMPRESSION ZSTD)"
     )
-    connection.execute(f"COPY ({select}) TO '{_sql(csv_tmp)}' (HEADER, DELIMITER ',')")
 
-    equality = _assert_parquet_csv_identical(connection, parquet_tmp, csv_tmp)
+    equality: dict[str, Any] | None = None
+    csv_tmp: Path | None = None
+    if write_csv:
+        csv_tmp = csv_path.with_name(f".{csv_path.name}.{uuid4().hex}.partial")
+        connection.execute(f"COPY ({select}) TO '{_sql(csv_tmp)}' (HEADER, DELIMITER ',')")
+        equality = _assert_parquet_csv_identical(connection, parquet_tmp, csv_tmp)
+
     os.replace(parquet_tmp, parquet_path)
-    os.replace(csv_tmp, csv_path)
+    if csv_tmp is not None:
+        os.replace(csv_tmp, csv_path)
 
     label, basis = year_label(spec.universe, spec.year)
     stats = connection.execute(
@@ -240,7 +291,7 @@ def _write_year(
         FROM read_parquet('{_sql(parquet_path)}')
         """
     ).fetchone()
-    return {
+    record: dict[str, Any] = {
         "year": spec.year,
         "label": label,
         "membership_basis": basis,
@@ -251,13 +302,18 @@ def _write_year(
         "first_date": str(stats[3]),
         "last_date": str(stats[4]),
         "parquet": _file_record(parquet_path, root),
-        "csv": _file_record(csv_path, root),
-        "parquet_csv_identical": True,
-        "parquet_csv_check": equality,
+        "csv_present": write_csv,
         "source": str(spec.source),
         "source_sha256": source_hash,
         "reused_unchanged": False,
     }
+    if write_csv:
+        record["csv"] = _file_record(csv_path, root)
+        record["parquet_csv_identical"] = True
+        record["parquet_csv_check"] = equality
+    else:
+        record["csv_absent_reason"] = CSV_DELETED_REASON
+    return record
 
 
 def _assert_parquet_csv_identical(
@@ -669,7 +725,10 @@ def build_manifest(
     for universe in universes.values():
         for year in universe["years"]:
             files.append({**year["parquet"], "kind": "OHLCV_PARQUET"})
-            files.append({**year["csv"], "kind": "OHLCV_CSV"})
+            # A year whose CSV the operator deleted has none to list. Listing one would make
+            # every integrity check fail on a file that is absent on purpose.
+            if year.get("csv"):
+                files.append({**year["csv"], "kind": "OHLCV_CSV"})
     files.extend(extra_records)
 
     manifest: dict[str, Any] = {
@@ -684,6 +743,21 @@ def build_manifest(
         "universes": universes,
         "calendar": calendar_summary,
         "corporate_actions": corporate_action_summary,
+        "csv_policy": {
+            "rule": (
+                "Every year has a Parquet file. A year may have no CSV: the CSV is a "
+                "convenience mirror roughly ten times the size, and deleting it to free disk "
+                "is supported. The engine will not recreate a deleted CSV for a past year, "
+                "and will not stop because one is missing."
+            ),
+            "to_get_a_deleted_csv_back": (
+                "Delete that year's Parquet file as well. The next run rebuilds both."
+            ),
+            "years_without_csv": {
+                name: [y["year"] for y in entry["years"] if not y.get("csv")]
+                for name, entry in universes.items()
+            },
+        },
         "label_meanings": {
             "BACKTEST_SAFE": "Real point-in-time membership exists for the whole year.",
             "PARTIAL": "Membership becomes trustworthy part-way through this year. Backtests "
@@ -813,6 +887,14 @@ def publish_dataset(*, root: Path | None = None, write_docs: bool = True) -> dic
                 for row in entry.get("years", []):
                     prior_years[f"{name}:{row['year']}"] = row
 
+        # The year currently being appended to. New data always gets a CSV, so a CSV wipe
+        # stops the mirror for old years without stopping it for good.
+        store_latest_date = connection.execute(
+            "SELECT MAX(Date) FROM read_parquet(?)",
+            [[str(s.source) for s in specs if s.universe == "nifty500"]],
+        ).fetchone()[0]
+        active_year = int(str(store_latest_date)[:4])
+
         universes: dict[str, Any] = {}
         for spec in specs:
             entry = universes.setdefault(
@@ -823,7 +905,9 @@ def publish_dataset(*, root: Path | None = None, write_docs: bool = True) -> dic
                     "years": [],
                 },
             )
-            entry["years"].append(_write_year(connection, spec, root, prior_years))
+            entry["years"].append(
+                _write_year(connection, spec, root, prior_years, active_year=active_year)
+            )
 
         for name, entry in universes.items():
             entry["years"].sort(key=lambda row: row["year"])

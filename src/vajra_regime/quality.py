@@ -392,8 +392,13 @@ def check_price_coverage_of_members(con: duckdb.DuckDBPyConnection, root: Path) 
 def check_parquet_csv_parity(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     """The publish step asserts this per year before writing. Report what it recorded."""
     years = []
+    without_csv = []
     for name, entry in manifest["universes"].items():
         for row in entry["years"]:
+            if not row.get("csv"):
+                # No CSV to compare against. Absence is a supported state, not a failure.
+                without_csv.append({"universe": name, "year": row["year"]})
+                continue
             years.append(
                 {
                     "universe": name,
@@ -404,6 +409,7 @@ def check_parquet_csv_parity(root: Path, manifest: dict[str, Any]) -> dict[str, 
     return {
         "years_checked": len(years),
         "years_identical": sum(1 for y in years if y["identical"]),
+        "years_without_a_csv": without_csv,
         "pass": all(y["identical"] for y in years),
         "method": (
             "Every year is written to Parquet and CSV from the same query, then compared with "

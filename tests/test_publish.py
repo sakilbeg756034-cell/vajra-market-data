@@ -388,3 +388,117 @@ def _quality_stub(*, external: dict) -> dict:
         "verdicts": {"survivorship": "PASS"},
         "overall": "PASS",
     }
+
+
+# ------------------------------------------------------------------ resilience: deletions
+
+
+def _year_setup(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnection, publish.YearSource, Path]:
+    con = duckdb.connect()
+    con.execute("SET enable_progress_bar=false")
+    source = tmp_path / "store" / "src.parquet"
+    _write_parquet(source, _frame(6))
+    return con, publish.YearSource("nifty500", 2024, source), tmp_path / "published"
+
+
+def test_a_deleted_parquet_is_rebuilt(tmp_path: Path) -> None:
+    """Parquet is the dataset. Losing one costs the time to write it again and nothing else."""
+    con, spec, root = _year_setup(tmp_path)
+    first = publish._write_year(con, spec, root, active_year=2026)
+    parquet = root / "nifty500" / "parquet" / "nifty500_2024.parquet"
+    parquet.unlink()
+
+    second = publish._write_year(con, spec, root, {"nifty500:2024": first}, active_year=2026)
+    assert parquet.is_file()
+    assert second["reused_unchanged"] is False
+    assert second["rows"] == 6
+
+
+def test_a_deleted_csv_for_an_old_year_stays_deleted(tmp_path: Path) -> None:
+    """The operator deletes CSVs when the disk fills. Recreating seventeen years of them on
+    the next run would silently undo that, so a year whose Parquet survives is left alone."""
+    con, spec, root = _year_setup(tmp_path)
+    first = publish._write_year(con, spec, root, active_year=2026)
+    csv_path = root / "nifty500" / "csv" / "nifty500_2024.csv"
+    csv_path.unlink()
+
+    second = publish._write_year(con, spec, root, {"nifty500:2024": first}, active_year=2026)
+    assert not csv_path.exists()
+    assert second["csv_present"] is False
+    assert "csv" not in second
+    assert "CSV_REMOVED_BY_OPERATOR" in second["csv_absent_reason"]
+
+
+def test_a_deleted_csv_for_the_current_year_is_rewritten(tmp_path: Path) -> None:
+    """New data always gets a CSV, so a wipe stops the mirror for old years without stopping
+    it for good - the engine resumes from that day forward."""
+    con, spec, root = _year_setup(tmp_path)
+    first = publish._write_year(con, spec, root, active_year=2024)
+    csv_path = root / "nifty500" / "csv" / "nifty500_2024.csv"
+    csv_path.unlink()
+
+    second = publish._write_year(con, spec, root, {"nifty500:2024": first}, active_year=2024)
+    assert csv_path.is_file()
+    assert second["csv_present"] is True
+
+
+def test_losing_both_files_rebuilds_both(tmp_path: Path) -> None:
+    """Both gone is a real gap, not a disk-space decision - which is what happens when the
+    whole published folder is deleted."""
+    con, spec, root = _year_setup(tmp_path)
+    first = publish._write_year(con, spec, root, active_year=2026)
+    (root / "nifty500" / "parquet" / "nifty500_2024.parquet").unlink()
+    (root / "nifty500" / "csv" / "nifty500_2024.csv").unlink()
+
+    second = publish._write_year(con, spec, root, {"nifty500:2024": first}, active_year=2026)
+    assert (root / "nifty500" / "parquet" / "nifty500_2024.parquet").is_file()
+    assert (root / "nifty500" / "csv" / "nifty500_2024.csv").is_file()
+    assert second["csv_present"] is True
+
+
+def test_a_corrupted_parquet_is_rebuilt(tmp_path: Path) -> None:
+    con, spec, root = _year_setup(tmp_path)
+    first = publish._write_year(con, spec, root, active_year=2026)
+    parquet = root / "nifty500" / "parquet" / "nifty500_2024.parquet"
+    parquet.write_bytes(b"not a parquet file")
+
+    second = publish._write_year(con, spec, root, {"nifty500:2024": first}, active_year=2026)
+    assert second["reused_unchanged"] is False
+    assert second["parquet"]["sha256"] == first["parquet"]["sha256"]
+
+
+def test_an_untouched_year_is_not_rewritten(tmp_path: Path) -> None:
+    con, spec, root = _year_setup(tmp_path)
+    first = publish._write_year(con, spec, root, active_year=2026)
+    second = publish._write_year(con, spec, root, {"nifty500:2024": first}, active_year=2026)
+    assert second["reused_unchanged"] is True
+
+
+def test_manifest_omits_a_year_with_no_csv(tmp_path: Path) -> None:
+    """Listing a CSV that is absent on purpose would make every integrity check fail."""
+    con, spec, root = _year_setup(tmp_path)
+    first = publish._write_year(con, spec, root, active_year=2026)
+    (root / "nifty500" / "csv" / "nifty500_2024.csv").unlink()
+    second = publish._write_year(con, spec, root, {"nifty500:2024": first}, active_year=2026)
+
+    universes = {
+        "nifty500": {
+            "definition": "d",
+            "years": [second],
+            "rows": second["rows"],
+            "first_date": second["first_date"],
+            "last_date": second["last_date"],
+        },
+    }
+    manifest = publish.build_manifest(
+        con,
+        root,
+        universes=universes,
+        extra_records=[],
+        calendar_summary={},
+        corporate_action_summary={},
+    )
+    paths_listed = [f["path"] for f in manifest["files"]]
+    assert "nifty500/parquet/nifty500_2024.parquet" in paths_listed
+    assert "nifty500/csv/nifty500_2024.csv" not in paths_listed
+    assert manifest["csv_policy"]["years_without_csv"]["nifty500"] == [2024]
