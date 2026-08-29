@@ -1,0 +1,16 @@
+# The engine builds OHLCV. That is the whole configuration surface.
+# Filesystem locations are NOT here - they live in src/vajra_regime/paths.py, driven by the
+# VAJRA_ENGINE_ROOT / VAJRA_STORE_ROOT / VAJRA_DATA_ROOT environment variables.
+
+project:
+  name: "VAJRA Data Engine"
+  timezone: "Asia/Kolkata"
+
+data:
+  # Working tables inside the store's DuckDB.
+  clean_table: "clean_daily"
+  universe_table: "monthly_vajra_750_universe"
+  # The VAJRA 750 is a rule, not an index: top N by 60-session median turnover, monthly.
+  expected_universe_size: 750
+  identity_column: "ISIN"
+  warmup_start: "2009-01-01"

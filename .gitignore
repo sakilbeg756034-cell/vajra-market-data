@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+secrets/
+credentials/
+service-account*.json
+
+# Editors and notebooks
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# Vajra large local data and generated outputs
+*.duckdb
+*.duckdb.wal
+*.parquet
+*.feather
+*.arrow
+*.csv
+*.xlsx
+*.xls
+*.zip
+data/raw/
+data/clean/
+data/features/
+outputs/
+reports/
+artifacts/
+
+# OS files
+.DS_Store
+Thumbs.db

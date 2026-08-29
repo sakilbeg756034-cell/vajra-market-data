@@ -1,0 +1,215 @@
+"""Tests for the corporate-action repair pass.
+
+The bug this module was written for: BHARTIARTL's 2009-07-24 1:2 face-value split was never
+applied to the pre-split history, leaving a -48.9% one-day "return" in a large cap that was
+still flagged research-eligible. These tests rebuild that situation in miniature.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from pathlib import Path
+
+import duckdb
+import pandas as pd
+import pytest
+
+from vajra_regime import ca_repair, paths
+
+
+def _write(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    con.register("f", frame)
+    con.execute(f"COPY (SELECT * FROM f) TO '{str(path).replace(chr(92), '/')}' (FORMAT PARQUET)")
+
+
+SESSIONS = [date(2024, 3, d) for d in (11, 12, 13, 14, 15)]
+EX_DATE = date(2024, 3, 14)
+
+
+def _unadjusted_series() -> pd.DataFrame:
+    """Closes of 200, 202, 204 then 103, 104 - a 1:2 split that was never applied."""
+    closes = [200.0, 202.0, 204.0, 103.0, 104.0]
+    returns = [None] + [closes[i] / closes[i - 1] - 1.0 for i in range(1, len(closes))]
+    return pd.DataFrame(
+        {
+            "Date": SESSIONS,
+            "Symbol": ["TESTCO"] * 5,
+            "ISIN": ["INE999Z01001"] * 5,
+            "Open": closes,
+            "High": [c * 1.01 for c in closes],
+            "Low": [c * 0.99 for c in closes],
+            "Close": closes,
+            "PointInTimePriceEligibilityClose": closes,
+            "Volume": [1000, 1100, 1200, 2600, 2700],
+            "PriceAdjustmentFactor": [1.0] * 5,
+            "VolumeAdjustmentFactor": [1.0] * 5,
+            "AdjustedReturn1D": returns,
+            "DiscontinuityClassification": ["NONE"] * 5,
+            "IsResearchEligible": [True] * 5,
+            "CorporateActionQuarantineReason": [""] * 5,
+        }
+    )
+
+
+def _reconciliation(action_type: str = "SPLIT", price_factor: float | None = 0.5) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "ExDate": [EX_DATE],
+            "Symbol": ["TESTCO"],
+            "ISIN": ["INE999Z01001"],
+            "ActionType": [action_type],
+            "Subject": ["Fv Split Rs10 To Rs5"],
+            "PriceFactor": [price_factor],
+            "VolumeFactor": [None if price_factor is None else 1.0 / price_factor],
+        }
+    )
+
+
+@pytest.fixture
+def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    pit = tmp_path / "store" / "NIFTY500 Point In Time"
+    monkeypatch.setattr(paths, "NIFTY500_PIT", pit)
+    monkeypatch.setattr(paths, "CLEAN_PARQUET_BY_YEAR", tmp_path / "store" / "clean")
+    monkeypatch.setattr(paths, "LOGS_ROOT", tmp_path / "logs")
+    (tmp_path / "store" / "clean").mkdir(parents=True, exist_ok=True)
+    return pit
+
+
+def _year_path(pit: Path) -> Path:
+    return pit / "08 Parquet" / "certified_adjusted" / "year=2024" / "nifty500_adjusted_daily.parquet"
+
+
+def test_unapplied_split_is_detected(store: Path) -> None:
+    _write(_year_path(store), _unadjusted_series())
+    _write(store / "04 Corporate Actions" / "nifty500_corporate_action_reconciliation.parquet",
+           _reconciliation())
+    con = duckdb.connect()
+    con.execute("SET enable_progress_bar=false")
+    found = ca_repair.detect(con, ca_repair.NIFTY500)
+    assert len(found["mechanical"]) == 1
+    event = found["mechanical"][0]
+    assert event["symbol"] == "TESTCO"
+    assert event["price_factor"] == 0.5
+    assert event["observed_move"] == pytest.approx(103.0 / 204.0 - 1.0, abs=1e-6)
+    assert event["move_after_repair"] == pytest.approx(103.0 / 102.0 - 1.0, abs=1e-6)
+
+
+def test_repair_rescales_history_and_fixes_the_boundary_return(store: Path) -> None:
+    _write(_year_path(store), _unadjusted_series())
+    _write(store / "04 Corporate Actions" / "nifty500_corporate_action_reconciliation.parquet",
+           _reconciliation())
+
+    result = ca_repair.repair()
+    entry = result["universes"]["nifty500"]
+    assert entry["action"] == "REPAIRED"
+    assert entry["verified"] is True
+
+    con = duckdb.connect()
+    frame = con.execute(
+        f"SELECT * FROM read_parquet('{str(_year_path(store)).replace(chr(92), '/')}') ORDER BY Date"
+    ).fetchdf()
+
+    # Pre-split closes halved, post-split untouched.
+    assert list(frame["Close"])[:3] == pytest.approx([100.0, 101.0, 102.0])
+    assert list(frame["Close"])[3:] == pytest.approx([103.0, 104.0])
+    # Open/High/Low rescaled with them.
+    assert frame["Open"].iloc[0] == pytest.approx(100.0)
+    assert frame["High"].iloc[0] == pytest.approx(202.0 * 0.5 * (1.0), abs=1.0)
+    # Volume doubled on the pre-split side only.
+    assert list(frame["Volume"])[:3] == [2000, 2200, 2400]
+    assert list(frame["Volume"])[3:] == [2600, 2700]
+    # The factor columns record what was applied.
+    assert list(frame["PriceAdjustmentFactor"])[:3] == pytest.approx([0.5, 0.5, 0.5])
+    assert list(frame["PriceAdjustmentFactor"])[3:] == pytest.approx([1.0, 1.0])
+    # Returns inside the pre-split period are unchanged; only the boundary moves.
+    assert frame["AdjustedReturn1D"].iloc[1] == pytest.approx(202.0 / 200.0 - 1.0)
+    assert frame["AdjustedReturn1D"].iloc[3] == pytest.approx(103.0 / 102.0 - 1.0)
+    assert frame["DiscontinuityClassification"].iloc[3] == ca_repair.REPAIR_NOTE
+
+
+def test_repair_is_idempotent(store: Path) -> None:
+    _write(_year_path(store), _unadjusted_series())
+    _write(store / "04 Corporate Actions" / "nifty500_corporate_action_reconciliation.parquet",
+           _reconciliation())
+
+    ca_repair.repair()
+    con = duckdb.connect()
+    path = str(_year_path(store)).replace("\\", "/")
+    after_first = con.execute(f"SELECT * FROM read_parquet('{path}') ORDER BY Date").fetchdf()
+
+    second = ca_repair.repair()
+    assert second["universes"]["nifty500"]["action"] == "NO_CHANGE"
+    after_second = con.execute(f"SELECT * FROM read_parquet('{path}') ORDER BY Date").fetchdf()
+    pd.testing.assert_frame_equal(after_first, after_second)
+
+
+def test_repair_never_changes_the_row_count(store: Path) -> None:
+    _write(_year_path(store), _unadjusted_series())
+    _write(store / "04 Corporate Actions" / "nifty500_corporate_action_reconciliation.parquet",
+           _reconciliation())
+    ca_repair.repair()
+    con = duckdb.connect()
+    rows = con.execute(
+        f"SELECT COUNT(*) FROM read_parquet('{str(_year_path(store)).replace(chr(92), '/')}')"
+    ).fetchone()[0]
+    assert rows == 5
+
+
+def test_non_mechanical_break_is_excluded_not_rescaled(store: Path) -> None:
+    """A demerger drop is a real print but not a real return. Prices must be left alone and
+    the row marked ineligible, because rescaling would need the value of what shareholders
+    received, which is not in this dataset."""
+    frame = _unadjusted_series()
+    _write(_year_path(store), frame)
+    _write(
+        store / "04 Corporate Actions" / "nifty500_corporate_action_reconciliation.parquet",
+        _reconciliation(action_type="DEMERGER", price_factor=None),
+    )
+
+    result = ca_repair.repair()
+    entry = result["universes"]["nifty500"]
+    assert entry["mechanical_count"] == 0
+    assert entry["non_mechanical_count"] == 1
+
+    con = duckdb.connect()
+    out = con.execute(
+        f"SELECT * FROM read_parquet('{str(_year_path(store)).replace(chr(92), '/')}') ORDER BY Date"
+    ).fetchdf()
+    # Prices untouched.
+    assert list(out["Close"]) == pytest.approx([200.0, 202.0, 204.0, 103.0, 104.0])
+    # Only the boundary row is excluded.
+    assert list(out["IsResearchEligible"]) == [True, True, True, False, True]
+    assert out["CorporateActionQuarantineReason"].iloc[3] == ca_repair.EXCLUSION_REASON
+
+
+def test_an_already_adjusted_series_is_left_alone(store: Path) -> None:
+    closes = [100.0, 101.0, 102.0, 103.0, 104.0]
+    returns = [None] + [closes[i] / closes[i - 1] - 1.0 for i in range(1, 5)]
+    frame = _unadjusted_series()
+    for column in ("Open", "High", "Low", "Close", "PointInTimePriceEligibilityClose"):
+        frame[column] = closes
+    frame["AdjustedReturn1D"] = returns
+    _write(_year_path(store), frame)
+    _write(store / "04 Corporate Actions" / "nifty500_corporate_action_reconciliation.parquet",
+           _reconciliation())
+
+    result = ca_repair.repair()
+    assert result["universes"]["nifty500"]["action"] == "NO_CHANGE"
+
+
+def test_factor_expression_compounds_two_events_in_the_right_order() -> None:
+    events = [
+        {"isin": "X", "ex_date": "2020-01-10", "price_factor": 0.5, "volume_factor": 2.0},
+        {"isin": "X", "ex_date": "2022-06-01", "price_factor": 0.2, "volume_factor": 5.0},
+    ]
+    expression = ca_repair._factor_expression(events, price=True)
+    # Before the first event both factors apply; between them only the second.
+    assert "0.1" in expression
+    assert "0.2" in expression
+    assert expression.strip().startswith("CASE")
+
+
+def test_factor_expression_is_neutral_when_there_is_nothing_to_do() -> None:
+    assert ca_repair._factor_expression([], price=True) == "1.0"
