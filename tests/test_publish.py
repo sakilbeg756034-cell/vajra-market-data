@@ -502,3 +502,55 @@ def test_manifest_omits_a_year_with_no_csv(tmp_path: Path) -> None:
     assert "nifty500/parquet/nifty500_2024.parquet" in paths_listed
     assert "nifty500/csv/nifty500_2024.csv" not in paths_listed
     assert manifest["csv_policy"]["years_without_csv"]["nifty500"] == [2024]
+
+
+# ------------------------------------------------------------------------ changelog
+
+
+def test_changelog_uses_ist_and_keeps_one_line_per_day(tmp_path: Path) -> None:
+    """A run at 03:18 IST is stamped 2026-08-29 by UTC, so the file appeared to run
+    backwards - 2026-08-30 followed by 2026-08-29, which reads as corruption."""
+    from datetime import date as _date
+
+    publish._append_changelog(tmp_path, _date(2026, 8, 29), "latest session 2026-08-28 - NO CHANGE")
+    publish._append_changelog(tmp_path, _date(2026, 8, 30), "latest session 2026-08-28 - NO CHANGE")
+    publish._append_changelog(tmp_path, _date(2026, 8, 30), "latest session 2026-08-28 - NO CHANGE")
+
+    lines = [
+        row for row in (tmp_path / "CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+        if row.startswith("- ")
+    ]
+    assert len(lines) == 2, lines
+    dates = [row.split(" - ")[0].removeprefix("- ") for row in lines]
+    assert dates == sorted(dates)
+    assert "IST" in (tmp_path / "CHANGELOG.md").read_text(encoding="utf-8")
+
+
+def test_a_day_that_changed_stays_marked_as_changed(tmp_path: Path) -> None:
+    """Four quiet runs after one real update must not erase the fact that the day updated."""
+    from datetime import date as _date
+
+    publish._append_changelog(tmp_path, _date(2026, 8, 30), "99 files - UPDATED")
+    publish._append_changelog(tmp_path, _date(2026, 8, 30), "99 files - NO CHANGE")
+    publish._append_changelog(tmp_path, _date(2026, 8, 30), "99 files - NO CHANGE")
+
+    lines = [
+        row for row in (tmp_path / "CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+        if row.startswith("- ")
+    ]
+    assert len(lines) == 1
+    assert "UPDATED" in lines[0]
+
+
+def test_changelog_survives_a_new_day_after_an_updated_day(tmp_path: Path) -> None:
+    from datetime import date as _date
+
+    publish._append_changelog(tmp_path, _date(2026, 8, 30), "99 files - UPDATED")
+    publish._append_changelog(tmp_path, _date(2026, 8, 31), "100 files - UPDATED")
+    lines = [
+        row for row in (tmp_path / "CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+        if row.startswith("- ")
+    ]
+    assert len(lines) == 2
+    assert lines[0].startswith("- 2026-08-30")
+    assert lines[1].startswith("- 2026-08-31")

@@ -23,7 +23,7 @@ import json
 import os
 import stat
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -821,17 +821,47 @@ def verify_published(root: Path | None = None) -> dict[str, Any]:
     }
 
 
-def _append_changelog(root: Path, line: str) -> None:
+CHANGELOG_HEADER = (
+    "# CHANGELOG\n\n"
+    "One line per day, dated in IST (UTC+5:30). Newest at the bottom. Written by the engine "
+    "on every run; do not edit by hand.\n\n"
+)
+
+
+def _append_changelog(root: Path, day: date, line: str) -> None:
+    """One line per day, replaced in place when that day already has one.
+
+    Two things were wrong before. The date came from ``datetime.now(UTC)``, so a run at
+    03:18 IST was stamped with the *previous* day and the file appeared to run backwards -
+    2026-08-30 followed by 2026-08-29, which reads as corruption. And every run appended a
+    line, so a day with four runs produced four lines, three of them saying nothing changed.
+
+    This dataset is a record of IST trading sessions, so its changelog is dated in IST too.
+    """
     path = root / "CHANGELOG.md"
-    header = (
-        "# CHANGELOG\n\n"
-        "One line per publish. Newest at the bottom. Written by the engine; do not edit "
-        "by hand.\n\n"
-    )
-    existing = path.read_text(encoding="utf-8") if path.is_file() else header
-    if not existing.endswith("\n"):
-        existing += "\n"
-    _atomic_text(path, existing + line + "\n")
+    lines: list[str] = []
+    header = CHANGELOG_HEADER
+    if path.is_file():
+        text = path.read_text(encoding="utf-8")
+        head, separator, body = text.partition("\n- ")
+        if separator:
+            header = head + "\n"
+            lines = [f"- {row.rstrip()}" for row in body.split("\n- ") if row.strip()]
+        else:
+            header = text if text.endswith("\n") else text + "\n"
+
+    stamp = day.isoformat()
+    today = f"- {stamp} - {line}"
+    if lines and lines[-1].startswith(f"- {stamp} "):
+        # A day that saw a real change stays marked as changed, however many quiet runs
+        # follow it.
+        if "UPDATED" in lines[-1] and "NO CHANGE" in today:
+            today = lines[-1]
+        lines[-1] = today
+    else:
+        lines.append(today)
+
+    _atomic_text(path, header + "\n".join(lines) + "\n")
 
 
 # --------------------------------------------------------------------------- entry point
@@ -971,9 +1001,12 @@ def publish_dataset(*, root: Path | None = None, write_docs: bool = True) -> dic
 
         changed = _data_hashes(previous) != _data_hashes(manifest)
         finished = datetime.now(UTC)
+        # IST observes no daylight saving, so a fixed offset is exact and needs no tz database.
+        ist_day = (finished + timedelta(hours=5, minutes=30)).date()
         _append_changelog(
             root,
-            f"- {finished.date().isoformat()} - latest session {manifest['latest_session']} - "
+            ist_day,
+            f"latest session {manifest['latest_session']} - "
             f"{manifest['file_count']} files, "
             f"{universes['nifty500']['rows']:,} NIFTY500 rows, "
             f"{universes['nifty750']['rows']:,} VAJRA750 rows - "
