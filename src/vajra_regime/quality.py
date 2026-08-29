@@ -694,15 +694,30 @@ def render_report(report: dict[str, Any]) -> str:
         add(ext["note"])
     else:
         add(ext.get("summary", ""))
+        add("")
+        add(ext.get("method", ""))
         if ext.get("symbols"):
             add("")
-            add("| Symbol | Source | Overlapping sessions | Median abs. close difference | Verdict |")
-            add("|---|---|---:|---:|---|")
+            add(
+                "| Symbol | Source | Overlapping sessions | Median abs. daily-return "
+                "difference | Sessions agreeing | Verdict |"
+            )
+            add("|---|---|---:|---:|---:|---|")
             for s in ext["symbols"]:
-                add(
-                    f"| `{s['symbol']}` | {s['source']} | {s['overlapping_sessions']:,} "
-                    f"| {s['median_abs_pct_diff']:.3%} | {s['verdict']} |"
-                )
+                # A symbol no external source could answer for has none of the comparison
+                # fields, so every cell is formatted defensively rather than indexed.
+                sessions = s.get("overlapping_sessions")
+                median = s.get("median_abs_return_difference")
+                agreement = s.get("sessions_agreeing_within_tolerance")
+                cells = [
+                    f"`{s['symbol']}`",
+                    s.get("source") or "—",
+                    f"{sessions:,}" if sessions else "—",
+                    f"{median:.5f}" if median is not None else "—",
+                    f"{agreement:.2%}" if agreement is not None else "—",
+                    s["verdict"],
+                ]
+                add("| " + " | ".join(cells) + " |")
     add("")
 
     add("## What this report does not check")

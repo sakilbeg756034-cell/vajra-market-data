@@ -277,3 +277,114 @@ def test_data_dictionary_covers_every_column_it_is_given() -> None:
     assert "`Date`" in text
     assert "`Close`" in text
     assert "INR" in text
+
+
+# --------------------------------------------------------------------- quality report render
+
+
+def test_quality_report_renders_with_an_external_crosscheck() -> None:
+    """The renderer read a key the cross-check module never produced, so the daily run crashed
+    the first time an external cross-check result existed on disk. Both shapes are covered
+    here: a symbol that was compared, and one no source could answer for."""
+    from vajra_regime import quality
+
+    report = _quality_stub(
+        external={
+            "status": "RUN",
+            "summary": "14 of 15 agree.",
+            "method": "Daily returns, not price levels.",
+            "symbols": [
+                {
+                    "symbol": "RELIANCE",
+                    "source": "yfinance",
+                    "overlapping_sessions": 4104,
+                    "median_abs_return_difference": 0.000029,
+                    "sessions_agreeing_within_tolerance": 0.9946,
+                    "verdict": "AGREES",
+                },
+                {"symbol": "TATAMOTORS", "verdict": "NO_EXTERNAL_SOURCE_ANSWERED"},
+            ],
+        }
+    )
+    text = quality.render_report(report)
+    assert "RELIANCE" in text
+    assert "TATAMOTORS" in text
+    assert "NO_EXTERNAL_SOURCE_ANSWERED" in text
+
+
+def test_quality_report_renders_without_an_external_crosscheck() -> None:
+    from vajra_regime import quality
+
+    report = _quality_stub(external={"status": "NOT_RUN", "note": "not run"})
+    assert "not run" in quality.render_report(report)
+
+
+def _quality_stub(*, external: dict) -> dict:
+    universe = {
+        "shape": {
+            "rows": 10,
+            "distinct_symbols": 2,
+            "distinct_isins": 2,
+            "sessions": 5,
+            "first_date": "2024-01-01",
+            "last_date": "2024-01-05",
+            "per_year": [
+                {
+                    "year": 2024,
+                    "rows": 10,
+                    "symbols": 2,
+                    "isins": 2,
+                    "sessions": 5,
+                    "first_date": "2024-01-01",
+                    "last_date": "2024-01-05",
+                }
+            ],
+        },
+        "missing_sessions": {"calendar_sessions": 5, "missing_session_count": 0,
+                             "missing_sessions": [], "pass": True},
+        "duplicates": {
+            "duplicate_date_symbol_groups": 0, "duplicate_date_symbol_extra_rows": 0,
+            "duplicate_date_symbol_examples": [], "duplicate_date_isin_groups": 0,
+            "duplicate_date_isin_extra_rows": 0, "duplicate_date_isin_examples": [],
+            "pass": True,
+        },
+        "bar_sanity": {
+            k: 0 for k in (
+                "rows", "null_date", "null_symbol", "null_isin", "null_close", "null_ohl",
+                "non_positive", "high_lt_low", "close_outside", "open_outside",
+                "null_volume", "zero_volume", "negative_volume", "fatal_total",
+            )
+        } | {"pass": True, "zero_volume_note": "note"},
+        "adjustment_sanity": {
+            "events_available": 1, "events_checked_against_prices": 1,
+            "residual_unadjusted_gaps": 0, "examples": [], "pass": True, "method": "m",
+        },
+        "eligibility": {
+            "rows": 10, "research_eligible": 10, "quarantined": 0,
+            "quarantined_fraction": 0.0, "top_quarantine_reasons": [],
+        },
+    }
+    return {
+        "version": "TEST",
+        "generated_at_utc": "2026-08-29T00:00:00+00:00",
+        "published_root": "D:/VAJRA_DATA",
+        "latest_session": "2024-01-05",
+        "manifest_payload_sha256": "x",
+        "universes": {"nifty500": universe, "nifty750": universe},
+        "survivorship": {
+            "pass": True, "snapshots": [{"date": "2024-01-01", "members": 500}],
+            "consecutive_overlaps": [], "first_vs_last_common_members": 1,
+            "current_members_absent_at_start": 1,
+            "securities_that_left_and_never_returned": 1,
+            "membership_rows_from_departed_securities": 1, "interpretation": "i",
+        },
+        "member_price_coverage": {
+            "member_sessions": 10, "member_sessions_without_price": 0, "fraction": 0.0,
+            "pass": True, "worst_symbols": [], "note": "n",
+        },
+        "parquet_csv_parity": {"years_checked": 1, "years_identical": 1, "pass": True,
+                               "method": "m"},
+        "external_crosscheck": external,
+        "verdicts": {"survivorship": "PASS"},
+        "overall": "PASS",
+    }
