@@ -40,8 +40,10 @@ def test_build_modules_never_read_the_published_dataset() -> None:
 def test_only_the_publisher_writes_to_the_published_root() -> None:
     """`paths.DATA_ROOT` may be referenced by the publisher, the quality checker and the
     documentation generator, and by nothing else."""
+    # The publisher writes it; the verification modules read it back on purpose, which is the
+    # whole point of checking the published files rather than the build pipeline's claims.
     allowed = {"publish.py", "publish_docs.py", "publish_runner.py", "quality.py",
-               "quality_runner.py", "paths.py", "config.py"}
+               "quality_runner.py", "external_check.py", "paths.py", "config.py"}
     offenders = []
     for path in (REPO_ROOT / "src" / "vajra_regime").rglob("*.py"):
         if path.name in allowed:
