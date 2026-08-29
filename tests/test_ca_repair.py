@@ -54,15 +54,23 @@ def _unadjusted_series() -> pd.DataFrame:
 
 
 def _reconciliation(action_type: str = "SPLIT", price_factor: float | None = 0.5) -> pd.DataFrame:
+    """The official archive as the engine reads it: raw NSE text, no pre-parsed ratio.
+
+    The detector parses the subject itself, so a fixture that handed it a ready-made factor
+    would not exercise the path that actually runs.
+    """
+    subject = {
+        "SPLIT": "Face Value Split From Rs.10/- To Rs.5/-",
+        "DEMERGER": "Demerger",
+    }.get(action_type, "Face Value Split From Rs.10/- To Rs.5/-")
     return pd.DataFrame(
         {
+            "EventId": ["EV1"],
             "ExDate": [EX_DATE],
             "Symbol": ["TESTCO"],
             "ISIN": ["INE999Z01001"],
-            "ActionType": [action_type],
-            "Subject": ["Fv Split Rs10 To Rs5"],
-            "PriceFactor": [price_factor],
-            "VolumeFactor": [None if price_factor is None else 1.0 / price_factor],
+            "Subject": [subject],
+            "Series": ["EQ"],
         }
     )
 
@@ -83,7 +91,7 @@ def _year_path(pit: Path) -> Path:
 
 def test_unapplied_split_is_detected(store: Path) -> None:
     _write(_year_path(store), _unadjusted_series())
-    _write(store / "04 Corporate Actions" / "nifty500_corporate_action_reconciliation.parquet",
+    _write(store / "04 Corporate Actions" / "nifty500_official_corporate_actions_all_equities.parquet",
            _reconciliation())
     con = duckdb.connect()
     con.execute("SET enable_progress_bar=false")
@@ -98,7 +106,7 @@ def test_unapplied_split_is_detected(store: Path) -> None:
 
 def test_repair_rescales_history_and_fixes_the_boundary_return(store: Path) -> None:
     _write(_year_path(store), _unadjusted_series())
-    _write(store / "04 Corporate Actions" / "nifty500_corporate_action_reconciliation.parquet",
+    _write(store / "04 Corporate Actions" / "nifty500_official_corporate_actions_all_equities.parquet",
            _reconciliation())
 
     result = ca_repair.repair()
@@ -131,7 +139,7 @@ def test_repair_rescales_history_and_fixes_the_boundary_return(store: Path) -> N
 
 def test_repair_is_idempotent(store: Path) -> None:
     _write(_year_path(store), _unadjusted_series())
-    _write(store / "04 Corporate Actions" / "nifty500_corporate_action_reconciliation.parquet",
+    _write(store / "04 Corporate Actions" / "nifty500_official_corporate_actions_all_equities.parquet",
            _reconciliation())
 
     ca_repair.repair()
@@ -147,7 +155,7 @@ def test_repair_is_idempotent(store: Path) -> None:
 
 def test_repair_never_changes_the_row_count(store: Path) -> None:
     _write(_year_path(store), _unadjusted_series())
-    _write(store / "04 Corporate Actions" / "nifty500_corporate_action_reconciliation.parquet",
+    _write(store / "04 Corporate Actions" / "nifty500_official_corporate_actions_all_equities.parquet",
            _reconciliation())
     ca_repair.repair()
     con = duckdb.connect()
@@ -164,7 +172,7 @@ def test_non_mechanical_break_is_excluded_not_rescaled(store: Path) -> None:
     frame = _unadjusted_series()
     _write(_year_path(store), frame)
     _write(
-        store / "04 Corporate Actions" / "nifty500_corporate_action_reconciliation.parquet",
+        store / "04 Corporate Actions" / "nifty500_official_corporate_actions_all_equities.parquet",
         _reconciliation(action_type="DEMERGER", price_factor=None),
     )
 
@@ -192,7 +200,7 @@ def test_an_already_adjusted_series_is_left_alone(store: Path) -> None:
         frame[column] = closes
     frame["AdjustedReturn1D"] = returns
     _write(_year_path(store), frame)
-    _write(store / "04 Corporate Actions" / "nifty500_corporate_action_reconciliation.parquet",
+    _write(store / "04 Corporate Actions" / "nifty500_official_corporate_actions_all_equities.parquet",
            _reconciliation())
 
     result = ca_repair.repair()
@@ -222,7 +230,7 @@ def test_a_duplicated_ledger_entry_is_applied_only_once(store: Path) -> None:
     _write(_year_path(store), _unadjusted_series())
     doubled = pd.concat([_reconciliation(), _reconciliation()], ignore_index=True)
     _write(
-        store / "04 Corporate Actions" / "nifty500_corporate_action_reconciliation.parquet",
+        store / "04 Corporate Actions" / "nifty500_official_corporate_actions_all_equities.parquet",
         doubled,
     )
 
@@ -235,3 +243,55 @@ def test_a_duplicated_ledger_entry_is_applied_only_once(store: Path) -> None:
     ).fetchdf()
     # Halved once (0.5), not twice (0.25).
     assert list(frame["Close"])[:3] == pytest.approx([100.0, 101.0, 102.0])
+
+
+def test_an_event_filed_under_the_old_isin_is_still_found(store: Path) -> None:
+    """A face-value change issues a NEW ISIN, so the event is filed under the old one while
+    the price rows already carry the new one. Matching on ISIN alone missed nine real events,
+    including HDFC's 2010 split, which left a phantom -79.4% crash in a top-ten constituent."""
+    _write(_year_path(store), _unadjusted_series())
+    archive = _reconciliation()
+    archive["ISIN"] = ["INE999Z01009"]  # the pre-split ISIN, different from the price rows
+    _write(
+        store / "04 Corporate Actions" / "nifty500_official_corporate_actions_all_equities.parquet",
+        archive,
+    )
+
+    con = duckdb.connect()
+    con.execute("SET enable_progress_bar=false")
+    found = ca_repair.detect(con, ca_repair.NIFTY500)
+    assert len(found["mechanical"]) == 1
+    assert found["mechanical"][0]["symbol"] == "TESTCO"
+    # And it reports the price rows' identity, not the stale one from the event.
+    assert found["mechanical"][0]["isin"] == "INE999Z01001"
+
+
+def test_a_ratio_that_does_not_explain_the_move_is_not_applied(store: Path) -> None:
+    """Rescaling on a ratio that leaves the boundary at -45% would be guessing. The row is
+    excluded instead, with the prices left exactly as the exchange reported them."""
+    frame = _unadjusted_series()
+    # A -89% print against a 1:5 split. It is close enough to -80% to be recognised as that
+    # event, but applying 0.2 would still leave the boundary at roughly -45%. This is AHCL's
+    # 2026-04-24 case, reproduced.
+    frame.loc[3, ["Open", "High", "Low", "Close", "PointInTimePriceEligibilityClose"]] = 22.5
+    frame.loc[3, "AdjustedReturn1D"] = 22.5 / 204.0 - 1.0
+    _write(_year_path(store), frame)
+    archive = _reconciliation()
+    archive["Subject"] = ["Face Value Split From Rs.10/- To Rs.2/-"]
+    _write(
+        store / "04 Corporate Actions" / "nifty500_official_corporate_actions_all_equities.parquet",
+        archive,
+    )
+
+    result = ca_repair.repair()
+    entry = result["universes"]["nifty500"]
+    assert entry["mechanical_count"] == 0
+    assert len(entry["unrepairable_residual"]) == 1
+    assert "RATIO_DOES_NOT_EXPLAIN" in entry["unrepairable_residual"][0]["handling"]
+
+    con = duckdb.connect()
+    out = con.execute(
+        f"SELECT * FROM read_parquet('{str(_year_path(store)).replace(chr(92), '/')}') ORDER BY Date"
+    ).fetchdf()
+    assert list(out["Close"])[:3] == pytest.approx([200.0, 202.0, 204.0])  # untouched
+    assert bool(out["IsResearchEligible"].iloc[3]) is False

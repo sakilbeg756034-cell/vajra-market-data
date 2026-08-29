@@ -44,6 +44,7 @@ from typing import Any
 from uuid import uuid4
 
 import duckdb
+import pandas as pd
 
 from vajra_regime import paths
 from vajra_regime.checkpoint import atomic_json, canonical_hash
@@ -109,12 +110,53 @@ def _sql(path: Path) -> str:
     return str(path).replace("\\", "/").replace("'", "''")
 
 
-def _reconciliation_path() -> Path:
+def _official_archive_path() -> Path:
+    """The complete official NSE corporate-action archive - every event, unfiltered.
+
+    Deliberately not the reconciliation file. The reconciliation joins events to the
+    point-in-time panel by ISIN, and a face-value change issues a *new* ISIN, so the event is
+    filed under the old one and the reconciliation drops it entirely. Nine real splits and
+    bonuses were invisible that way, including HDFC's 2010 face-value split, which left a
+    phantom -79.4% crash in a top-ten index constituent. A safety net that depends on the
+    thing it is meant to catch is not a safety net.
+    """
     return (
         paths.NIFTY500_PIT
         / "04 Corporate Actions"
-        / "nifty500_corporate_action_reconciliation.parquet"
+        / "nifty500_official_corporate_actions_all_equities.parquet"
     )
+
+
+def _parsed_events(con: duckdb.DuckDBPyConnection) -> str:
+    """Register every archived event with its parsed ratio; return the view name."""
+    from vajra_regime.nifty500_migration.corporate_action_reconciliation import (  # noqa: PLC0415
+        classify_official_action,
+    )
+
+    archive = _official_archive_path()
+    rows = con.execute(
+        f"SELECT EventId, Symbol, ISIN, Subject, ExDate FROM read_parquet('{_sql(archive)}') "
+        "WHERE ExDate IS NOT NULL"
+    ).fetchall()
+    records = []
+    for event_id, symbol, isin, subject, ex_date in rows:
+        parsed = classify_official_action(subject or "")
+        records.append(
+            {
+                "EventId": event_id,
+                "Symbol": symbol,
+                "ISIN": isin,
+                "Subject": subject,
+                "ExDate": ex_date,
+                "ActionType": parsed.action_type,
+                "PriceFactor": parsed.price_factor,
+                "VolumeFactor": parsed.volume_factor,
+                "ParseStatus": parsed.parse_status,
+            }
+        )
+    con.register("_events_frame", pd.DataFrame(records))
+    con.execute("CREATE OR REPLACE TEMP VIEW _events AS SELECT * FROM _events_frame")
+    return "_events"
 
 
 def year_files(universe: str) -> dict[int, Path]:
@@ -138,9 +180,9 @@ def year_files(universe: str) -> dict[int, Path]:
 def detect(con: duckdb.DuckDBPyConnection, spec: UniverseSpec) -> dict[str, list[dict[str, Any]]]:
     paths_for_universe = list(year_files(spec.name).values())
     if not paths_for_universe:
-        return {"mechanical": [], "non_mechanical": []}
+        return {"mechanical": [], "non_mechanical": [], "unrepairable_residual": []}
     files = ", ".join(f"'{_sql(p)}'" for p in paths_for_universe)
-    rec = _sql(_reconciliation_path())
+    _parsed_events(con)
     con.execute(
         "CREATE OR REPLACE TEMP VIEW _prices AS "
         f'SELECT Date, Symbol, ISIN, Close, "{spec.return_column}" AS Ret, '
@@ -153,22 +195,34 @@ def detect(con: duckdb.DuckDBPyConnection, spec: UniverseSpec) -> dict[str, list
     # happened the first time drill 4 was run twice against the same store.
     mechanical = con.execute(
         f"""
-        SELECT DISTINCT r.ExDate, r.Symbol, r.ISIN, r.ActionType, r.Subject,
+        SELECT DISTINCT r.ExDate, p.Symbol, p.ISIN, r.ActionType, r.Subject,
                r.PriceFactor, r.VolumeFactor, p.Ret
-        FROM read_parquet('{rec}') r
-        JOIN _prices p ON p.ISIN = r.ISIN AND p.Date = r.ExDate
+        FROM _events r
+        JOIN _prices p
+          ON p.Date = r.ExDate
+         -- Match on ISIN *or* symbol. A face-value change issues a NEW ISIN, so the event is
+         -- filed under the old one while the price rows already carry the new one, and an
+         -- ISIN-only join silently misses it. That is how HDFC kept a phantom -79.4% crash on
+         -- 2010-08-18: event under INE001A01028, prices under INE001A01036. Nine such events
+         -- were hiding this way, in HDFC, STERLITE, TULIP, SINTEX, GRUH, COX&KINGS and
+         -- JMTAUTOLTD.
+         AND (p.ISIN = r.ISIN OR p.Symbol = r.Symbol)
         WHERE r.PriceFactor IS NOT NULL AND r.PriceFactor <> 1.0
           AND p.Ret IS NOT NULL
           AND abs(p.Ret) > {UNAPPLIED_MOVE_THRESHOLD}
+          -- The ratio guard is what makes the looser symbol join safe: a coincidental symbol
+          -- collision would have to land on the exact ex-date AND produce almost exactly the
+          -- move an unapplied event of that ratio would produce.
           AND abs(p.Ret - (r.PriceFactor - 1.0)) < {UNAPPLIED_MATCH_TOLERANCE}
         ORDER BY r.ExDate
         """
     ).fetchall()
     non_mechanical = con.execute(
         f"""
-        SELECT DISTINCT r.ExDate, r.Symbol, r.ISIN, r.ActionType, r.Subject, p.Ret
-        FROM read_parquet('{rec}') r
-        JOIN _prices p ON p.ISIN = r.ISIN AND p.Date = r.ExDate
+        SELECT DISTINCT r.ExDate, p.Symbol, p.ISIN, r.ActionType, r.Subject, p.Ret
+        FROM _events r
+        JOIN _prices p
+          ON p.Date = r.ExDate AND (p.ISIN = r.ISIN OR p.Symbol = r.Symbol)
         WHERE (r.PriceFactor IS NULL OR r.PriceFactor = 1.0)
           AND p.Ret IS NOT NULL AND p.Ret <= -{NON_MECHANICAL_MOVE_THRESHOLD}
           -- Already handled on a previous run. Without this the pass would rewrite the same
@@ -187,7 +241,33 @@ def detect(con: duckdb.DuckDBPyConnection, spec: UniverseSpec) -> dict[str, list
         deduped.append(row)
     mechanical = deduped
 
+    # Only repair when the repair actually fixes it. If applying the ratio would still leave
+    # an extreme move at the boundary, the ratio is wrong, the date is wrong, or two events
+    # coincide - and rescaling on a guess is worse than leaving the row flagged. AHCL's
+    # 2026-04-24 event is one of these: a 1:5 split against a -89% print, which would still
+    # be -45% after the factor.
+    repairable = []
+    residual = []
+    for row in mechanical:
+        after = (1.0 + float(row[7])) / float(row[5]) - 1.0
+        (repairable if abs(after) <= REPAIRED_MOVE_TOLERANCE else residual).append(row)
+    mechanical = repairable
+
     return {
+        "unrepairable_residual": [
+            {
+                "ex_date": str(r[0]),
+                "symbol": r[1],
+                "isin": r[2],
+                "action_type": r[3],
+                "subject": r[4],
+                "price_factor": float(r[5]),
+                "observed_move": round(float(r[7]), 6),
+                "move_if_repaired": round((1.0 + float(r[7])) / float(r[5]) - 1.0, 6),
+                "handling": "EXCLUDED_NOT_REPAIRED_RATIO_DOES_NOT_EXPLAIN_THE_MOVE",
+            }
+            for r in residual
+        ],
         "mechanical": [
             {
                 "ex_date": str(r[0]),
@@ -360,10 +440,13 @@ def repair_universe(
         }
     found = detect(con, spec)
     mechanical = found["mechanical"]
-    non_mechanical = found["non_mechanical"]
+    # An event whose ratio does not explain the move is handled like a demerger: nothing is
+    # rescaled, the boundary row is simply marked not research-eligible.
+    non_mechanical = found["non_mechanical"] + found.get("unrepairable_residual", [])
     entry: dict[str, Any] = {
         "unapplied_mechanical_events": mechanical,
         "non_mechanical_price_breaks": non_mechanical,
+        "unrepairable_residual": found.get("unrepairable_residual", []),
         "mechanical_count": len(mechanical),
         "non_mechanical_count": len(non_mechanical),
         "files_rewritten": [],
