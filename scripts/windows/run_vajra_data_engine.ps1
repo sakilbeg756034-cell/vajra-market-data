@@ -37,7 +37,10 @@ function Write-Status {
         note              = "On failure the previously published dataset is left untouched."
     }
     $Temporary = "$StatusPath.$([guid]::NewGuid().ToString('N')).tmp"
-    $Payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Temporary -Encoding UTF8
+    # Set-Content -Encoding UTF8 writes a BOM on Windows PowerShell, and json.loads rejects a
+    # BOM. Write UTF-8 without one so the file is readable by the obvious json.load().
+    $Json = $Payload | ConvertTo-Json -Depth 5
+    [System.IO.File]::WriteAllText($Temporary, $Json, (New-Object System.Text.UTF8Encoding($false)))
     Move-Item -LiteralPath $Temporary -Destination $StatusPath -Force
 }
 

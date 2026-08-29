@@ -213,3 +213,25 @@ def test_factor_expression_compounds_two_events_in_the_right_order() -> None:
 
 def test_factor_expression_is_neutral_when_there_is_nothing_to_do() -> None:
     assert ca_repair._factor_expression([], price=True) == "1.0"
+
+
+def test_a_duplicated_ledger_entry_is_applied_only_once(store: Path) -> None:
+    """NSE republishes revised corporate actions, so the same split can appear twice for one
+    (ISIN, ex-date). Compounding it would scale the history by the factor squared - which is
+    exactly what happened the first time drill 4 ran twice against the same store."""
+    _write(_year_path(store), _unadjusted_series())
+    doubled = pd.concat([_reconciliation(), _reconciliation()], ignore_index=True)
+    _write(
+        store / "04 Corporate Actions" / "nifty500_corporate_action_reconciliation.parquet",
+        doubled,
+    )
+
+    result = ca_repair.repair()
+    assert result["universes"]["nifty500"]["mechanical_count"] == 1
+
+    con = duckdb.connect()
+    frame = con.execute(
+        f"SELECT * FROM read_parquet('{str(_year_path(store)).replace(chr(92), '/')}') ORDER BY Date"
+    ).fetchdf()
+    # Halved once (0.5), not twice (0.25).
+    assert list(frame["Close"])[:3] == pytest.approx([100.0, 101.0, 102.0])

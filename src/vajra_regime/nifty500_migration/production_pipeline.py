@@ -162,6 +162,36 @@ def run_nifty500_production_pipeline(
     recheck_days: int = DEFAULT_RECHECK_DAYS,
     publish: bool = True,
 ) -> dict[str, Any]:
+    """Wrapper that guarantees a failure is recorded where a success would have been."""
+    try:
+        return _run_pipeline(
+            config=config, now_ist=now_ist, recheck_days=recheck_days, publish=publish
+        )
+    except Exception as error:
+        failure: dict[str, Any] = {
+            "status": "FAILED",
+            "version": "vajra_data_engine_v1",
+            "generated_at_utc": datetime.now(UTC).isoformat(),
+            "error": f"{type(error).__name__}: {error}",
+            "published_data_left_intact": True,
+            "note": (
+                "The run stopped before publishing. Whatever is in the published folder is "
+                "the last dataset that passed every check."
+            ),
+        }
+        failure["status_payload_sha256"] = canonical_hash(failure)
+        PRODUCTION_STATUS.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json(PRODUCTION_STATUS, failure)
+        raise
+
+
+def _run_pipeline(
+    *,
+    config: AppConfig | None = None,
+    now_ist: datetime | None = None,
+    recheck_days: int = DEFAULT_RECHECK_DAYS,
+    publish: bool = True,
+) -> dict[str, Any]:
     """Fetch, rebuild, repair, certify and publish. One job, in that order.
 
     The published dataset is fingerprinted before and after the build phase. It must not

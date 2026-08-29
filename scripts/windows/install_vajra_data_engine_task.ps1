@@ -19,6 +19,9 @@
 $ErrorActionPreference = "Stop"
 
 $TaskName = "VAJRA Data Engine"
+# Registering at the root task path needs elevation on this machine; a subfolder does not,
+# and the operator should not have to run an elevated prompt to keep his data current.
+$TaskPath = "\VAJRA\"
 $EngineRoot = "D:\VAJRA_ENGINE"
 $Script = Join-Path $EngineRoot "code\scripts\windows\run_vajra_data_engine.ps1"
 
@@ -32,8 +35,9 @@ $Action = New-ScheduledTaskAction `
 # 19:30 IST: comfortably after the 15:30 close and after NSE has published the day's bhavcopy.
 $Trigger = New-ScheduledTaskTrigger -Daily -At 19:30
 # A second trigger at logon so a laptop that was off all day catches up as soon as it is used,
-# without waiting for the next 19:30.
-$LogonTrigger = New-ScheduledTaskTrigger -AtLogOn
+# without waiting for the next 19:30. -User matters: an at-logon trigger without one means
+# "any user", which Windows will not let a non-administrator register.
+$LogonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $LogonTrigger.Delay = "PT5M"
 
 $Settings = New-ScheduledTaskSettingsSet `
@@ -48,18 +52,19 @@ $Settings = New-ScheduledTaskSettingsSet `
 
 $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
-Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue
 
 Register-ScheduledTask `
     -TaskName $TaskName `
+    -TaskPath $TaskPath `
     -Action $Action `
     -Trigger @($Trigger, $LogonTrigger) `
     -Settings $Settings `
     -Principal $Principal `
     -Description "Keeps D:\VAJRA_DATA current: fetches every uncertified NSE session, rebuilds, repairs corporate actions, verifies and republishes. Self-heals gaps of any length." | Out-Null
 
-$Task = Get-ScheduledTask -TaskName $TaskName
-Write-Host "Registered: $($Task.TaskName)  state=$($Task.State)"
+$Task = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath
+Write-Host "Registered: $($Task.TaskPath)$($Task.TaskName)  state=$($Task.State)"
 Write-Host "Triggers  : daily 19:30, plus at logon (5 min delay)"
 Write-Host "Battery   : starts on battery, does not stop on battery"
 Write-Host "Missed run: StartWhenAvailable = true"

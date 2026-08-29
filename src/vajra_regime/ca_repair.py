@@ -147,9 +147,13 @@ def detect(con: duckdb.DuckDBPyConnection, spec: UniverseSpec) -> dict[str, list
         f'"{spec.reason_column}" AS Reason '
         f"FROM read_parquet([{files}])"
     )
+    # DISTINCT is load-bearing. NSE republishes revised corporate-action entries, so the same
+    # split can appear twice in the ledger for one (ISIN, ex-date). Without this the repair
+    # compounds the factor and scales the history by f squared - which is exactly what
+    # happened the first time drill 4 was run twice against the same store.
     mechanical = con.execute(
         f"""
-        SELECT r.ExDate, r.Symbol, r.ISIN, r.ActionType, r.Subject,
+        SELECT DISTINCT r.ExDate, r.Symbol, r.ISIN, r.ActionType, r.Subject,
                r.PriceFactor, r.VolumeFactor, p.Ret
         FROM read_parquet('{rec}') r
         JOIN _prices p ON p.ISIN = r.ISIN AND p.Date = r.ExDate
@@ -162,7 +166,7 @@ def detect(con: duckdb.DuckDBPyConnection, spec: UniverseSpec) -> dict[str, list
     ).fetchall()
     non_mechanical = con.execute(
         f"""
-        SELECT r.ExDate, r.Symbol, r.ISIN, r.ActionType, r.Subject, p.Ret
+        SELECT DISTINCT r.ExDate, r.Symbol, r.ISIN, r.ActionType, r.Subject, p.Ret
         FROM read_parquet('{rec}') r
         JOIN _prices p ON p.ISIN = r.ISIN AND p.Date = r.ExDate
         WHERE (r.PriceFactor IS NULL OR r.PriceFactor = 1.0)
@@ -173,6 +177,16 @@ def detect(con: duckdb.DuckDBPyConnection, spec: UniverseSpec) -> dict[str, list
         ORDER BY r.ExDate
         """
     ).fetchall()
+    seen: set[tuple[str, str]] = set()
+    deduped = []
+    for row in mechanical:
+        key = (str(row[2]), str(row[0]))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    mechanical = deduped
+
     return {
         "mechanical": [
             {
@@ -363,12 +377,23 @@ def repair_universe(
         entry["verified"] = None
         return entry
 
-    # A mechanical event rescales every year up to and including its ex-date year. A
-    # non-mechanical exclusion touches only its own year.
+    # A mechanical event rescales every year up to and including its ex-date year - but only
+    # the years that actually hold rows for that security. Rewriting a year in which the
+    # security never traded produces a byte-different file with identical contents, which
+    # churns the published dataset and defeats the publisher's unchanged-year reuse.
     touched: set[int] = set()
     for event in mechanical:
         ex_year = int(event["ex_date"][:4])
-        touched.update(y for y in files if y <= ex_year)
+        for year, path in files.items():
+            if year > ex_year:
+                continue
+            has_rows = con.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{_sql(path)}') WHERE ISIN = ? AND Date < ?",
+                [event["isin"], date.fromisoformat(event["ex_date"])],
+            ).fetchone()[0]
+            if has_rows:
+                touched.add(year)
+        touched.add(ex_year)  # the boundary row's stored return has to be patched
     touched.update(int(e["ex_date"][:4]) for e in non_mechanical)
 
     for year in sorted(touched):

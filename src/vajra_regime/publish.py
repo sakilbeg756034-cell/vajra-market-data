@@ -878,9 +878,14 @@ def publish_dataset(*, root: Path | None = None, write_docs: bool = True) -> dic
         if not verification["pass"]:
             raise RuntimeError(f"Published dataset failed verification: {verification}")
 
-        changed = previous is None or previous.get("manifest_payload_sha256") != manifest[
-            "manifest_payload_sha256"
-        ]
+        # Compare the data, not the whole manifest: the manifest carries generated_at_utc, so
+        # its own hash changes on every run and would report UPDATED even on a quiet Sunday.
+        def _data_hashes(payload: dict[str, Any] | None) -> dict[str, str]:
+            if not payload:
+                return {}
+            return {row["path"]: row["sha256"] for row in payload.get("files", [])}
+
+        changed = _data_hashes(previous) != _data_hashes(manifest)
         finished = datetime.now(UTC)
         _append_changelog(
             root,
