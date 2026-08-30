@@ -35,6 +35,11 @@ from vajra_regime.checkpoint import atomic_json, canonical_hash, sha256_file
 
 PUBLISH_VERSION = "VAJRA_DATA_V1"
 
+# Bump this whenever the published columns change. A year is only reused if its stamp
+# matches: without that, adding a column silently leaves every past year on the old
+# schema, because the reuse test only looks at whether the SOURCE changed.
+PUBLISH_FORMAT_VERSION = "2026-08-30-tradability-columns"
+
 # The first date on which official NIFTY 500 constituent evidence exists. Before this the
 # membership panel is reconstructed by reversing later official index changes: the prices are
 # real, the membership is an estimate. This single number drives every year label.
@@ -171,7 +176,14 @@ def year_label(universe: str, year: int) -> tuple[str, str]:
 
 
 def _normalised_select(connection: duckdb.DuckDBPyConnection, source: Path) -> str:
-    """SELECT that drops the redundant partition column and NULLs the empty-string column."""
+    """SELECT that drops the redundant partition column, NULLs the empty-string column, and
+    adds the two tradability columns.
+
+    Corporate actions are clean now, so the remaining way a backtest goes wrong is subtler:
+    the price is right, but nobody could have traded at it. These two columns hand the reader
+    the filters for that, rather than the engine deciding for them and quietly dropping real
+    data.
+    """
     columns = [
         row[0]
         for row in connection.execute(
@@ -187,6 +199,21 @@ def _normalised_select(connection: duckdb.DuckDBPyConnection, source: Path) -> s
             parts.append(f'NULLIF("{name}", \'\') AS "{name}"')
         else:
             parts.append(f'"{name}"')
+
+    # Open = High = Low = Close means the session had no intraday range at all: a circuit
+    # limit, or a single trade. A backtest that assumes it filled anywhere other than that
+    # one price is inventing a fill.
+    parts.append('(Open = High AND High = Low AND Low = Close) AS "IsFrozenBar"')
+    # Traded value in rupees. nifty750 carries it already; nifty500 has only the raw exchange
+    # figure under a name that does not say what it is. Turnover is invariant under a split
+    # (price x f, quantity / f), so the raw figure is the right one either way.
+    turnover = (
+        "Turnover"
+        if "Turnover" in columns
+        else ("RawTurnover" if "RawTurnover" in columns else "Close * Volume")
+    )
+    parts.append(f'CAST({turnover} AS DOUBLE) AS "TurnoverINR"')
+
     return f"SELECT {', '.join(parts)} FROM read_parquet('{_sql(source)}')"
 
 
@@ -249,6 +276,7 @@ def _write_year(
     unchanged = (
         prior is not None
         and prior.get("source_sha256") == source_hash
+        and prior.get("format_version") == PUBLISH_FORMAT_VERSION
         and parquet_ok
         and (csv_ok or csv_intentionally_absent)
     )
@@ -305,6 +333,7 @@ def _write_year(
         "csv_present": write_csv,
         "source": str(spec.source),
         "source_sha256": source_hash,
+        "format_version": PUBLISH_FORMAT_VERSION,
         "reused_unchanged": False,
     }
     if write_csv:

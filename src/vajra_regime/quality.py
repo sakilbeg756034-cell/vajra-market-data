@@ -389,6 +389,77 @@ def check_price_coverage_of_members(con: duckdb.DuckDBPyConnection, root: Path) 
     }
 
 
+def check_tradability(
+    con: duckdb.DuckDBPyConnection, root: Path, universe: str
+) -> dict[str, Any]:
+    """Could a strategy actually have traded these rows?
+
+    With corporate actions clean, this is the remaining way a backtest goes wrong: the price
+    is correct and untradeable. A frozen bar is a circuit limit or a single trade, so a fill
+    anywhere but that one price is invented. A session turning over a lakh of rupees cannot
+    absorb a real position.
+
+    These are reported, never excluded. They are genuine characteristics of Indian mid and
+    small caps, not errors, and removing them would quietly narrow the universe.
+    """
+    g = _glob(root, universe)
+    row = con.execute(
+        f"""
+        SELECT COUNT(*),
+               SUM(CASE WHEN IsFrozenBar THEN 1 ELSE 0 END),
+               SUM(CASE WHEN TurnoverINR < 100000 THEN 1 ELSE 0 END),
+               SUM(CASE WHEN TurnoverINR < 1000000 THEN 1 ELSE 0 END),
+               SUM(CASE WHEN TurnoverINR < 10000000 THEN 1 ELSE 0 END),
+               SUM(CASE WHEN Volume = 0 THEN 1 ELSE 0 END)
+        FROM read_parquet('{g}')
+        WHERE IsResearchEligible
+        """
+    ).fetchone()
+    eligible = int(row[0] or 0)
+
+    def share(value: Any) -> float:
+        return round(int(value or 0) / eligible, 6) if eligible else 0.0
+
+    # The longest run of sessions on which the close did not move at all.
+    stale = con.execute(
+        f"""
+        SELECT MAX(n), SUM(CASE WHEN n >= 5 THEN n ELSE 0 END)
+        FROM (
+          SELECT ISIN, RunId, COUNT(*) AS n FROM (
+            SELECT ISIN, Close,
+                   SUM(CASE WHEN Close = Prev THEN 0 ELSE 1 END) OVER (
+                     PARTITION BY ISIN ORDER BY Date
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunId
+            FROM (
+              SELECT Date, ISIN, Close,
+                     LAG(Close) OVER (PARTITION BY ISIN ORDER BY Date) AS Prev
+              FROM read_parquet('{g}') WHERE ISIN IS NOT NULL AND IsResearchEligible
+            )
+          ) GROUP BY 1, 2
+        )
+        """
+    ).fetchone()
+
+    return {
+        "research_eligible_rows": eligible,
+        "frozen_bars": int(row[1] or 0),
+        "frozen_bars_share": share(row[1]),
+        "turnover_under_1_lakh": int(row[2] or 0),
+        "turnover_under_1_lakh_share": share(row[2]),
+        "turnover_under_10_lakh": int(row[3] or 0),
+        "turnover_under_10_lakh_share": share(row[3]),
+        "turnover_under_1_crore": int(row[4] or 0),
+        "turnover_under_1_crore_share": share(row[4]),
+        "zero_volume": int(row[5] or 0),
+        "longest_unchanged_close_run_sessions": int(stale[0] or 0),
+        "rows_in_unchanged_close_runs_of_5_or_more": int(stale[1] or 0),
+        "note": (
+            "Reported, not excluded. These are real liquidity characteristics, not data "
+            "errors. Filter on IsFrozenBar and TurnoverINR to match your own position size."
+        ),
+    }
+
+
 def check_parquet_csv_parity(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     """The publish step asserts this per year before writing. Report what it recorded."""
     years = []
@@ -468,6 +539,7 @@ def run_quality_checks(root: Path | None = None) -> dict[str, Any]:
             "bar_sanity": check_bar_sanity(con, root, universe),
             "adjustment_sanity": check_adjustment_sanity(con, root, universe),
             "eligibility": check_eligibility_and_quarantine(con, root, universe),
+            "tradability": check_tradability(con, root, universe),
         }
     report["survivorship"] = check_survivorship(con, root)
     report["member_price_coverage"] = check_price_coverage_of_members(con, root)
@@ -619,6 +691,44 @@ def render_report(report: dict[str, Any]) -> str:
                     f"- {ex['ex_date']} `{ex['symbol']}` {ex['action']} "
                     f"factor {ex['price_factor']} left a {ex['adjusted_move']:+.1%} move"
                 )
+        add("")
+
+        tr = checks["tradability"]
+        add("### Tradability")
+        add("")
+        add(
+            "Corporate actions are clean, so this is the remaining way a backtest goes wrong: "
+            "the price is correct and nobody could have traded at it."
+        )
+        add("")
+        add("| Condition | Rows | Share of research-eligible |")
+        add("|---|---:|---:|")
+        add(
+            f"| Frozen bar (open = high = low = close) | {tr['frozen_bars']:,} "
+            f"| {tr['frozen_bars_share']:.2%} |"
+        )
+        add(
+            f"| Turnover under Rs 1 lakh | {tr['turnover_under_1_lakh']:,} "
+            f"| {tr['turnover_under_1_lakh_share']:.2%} |"
+        )
+        add(
+            f"| Turnover under Rs 10 lakh | {tr['turnover_under_10_lakh']:,} "
+            f"| {tr['turnover_under_10_lakh_share']:.2%} |"
+        )
+        add(
+            f"| Turnover under Rs 1 crore | {tr['turnover_under_1_crore']:,} "
+            f"| {tr['turnover_under_1_crore_share']:.2%} |"
+        )
+        add(f"| Zero volume | {tr['zero_volume']:,} | — |")
+        add("")
+        add(
+            f"Longest run of sessions with an unchanged close: "
+            f"**{tr['longest_unchanged_close_run_sessions']}**. "
+            f"{tr['rows_in_unchanged_close_runs_of_5_or_more']:,} rows sit in a run of five "
+            "or more."
+        )
+        add("")
+        add(tr["note"])
         add("")
 
         el = checks["eligibility"]

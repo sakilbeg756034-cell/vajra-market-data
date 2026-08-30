@@ -363,6 +363,14 @@ def _quality_stub(*, external: dict) -> dict:
             "rows": 10, "research_eligible": 10, "quarantined": 0,
             "quarantined_fraction": 0.0, "top_quarantine_reasons": [],
         },
+        "tradability": {
+            "research_eligible_rows": 10, "frozen_bars": 1, "frozen_bars_share": 0.1,
+            "turnover_under_1_lakh": 2, "turnover_under_1_lakh_share": 0.2,
+            "turnover_under_10_lakh": 3, "turnover_under_10_lakh_share": 0.3,
+            "turnover_under_1_crore": 4, "turnover_under_1_crore_share": 0.4,
+            "zero_volume": 0, "longest_unchanged_close_run_sessions": 3,
+            "rows_in_unchanged_close_runs_of_5_or_more": 0, "note": "reported not excluded",
+        },
     }
     return {
         "version": "TEST",
@@ -554,3 +562,60 @@ def test_changelog_survives_a_new_day_after_an_updated_day(tmp_path: Path) -> No
     assert len(lines) == 2
     assert lines[0].startswith("- 2026-08-30")
     assert lines[1].startswith("- 2026-08-31")
+
+
+# ----------------------------------------------------------------- tradability columns
+
+
+def test_published_rows_carry_the_two_tradability_columns(tmp_path: Path) -> None:
+    """Corporate actions are clean, so the remaining way a backtest goes wrong is a price
+    nobody could have traded at. The reader gets the filters, not a silent exclusion."""
+    con = duckdb.connect()
+    con.execute("SET enable_progress_bar=false")
+    source = tmp_path / "src.parquet"
+    frame = _frame(4)
+    # Row 0 is a frozen bar: no intraday range at all.
+    frame.loc[0, ["Open", "High", "Low", "Close"]] = 100.0
+    _write_parquet(source, frame)
+
+    select = publish._normalised_select(con, source)
+    out = con.execute(f"SELECT * FROM ({select}) ORDER BY Date").fetchdf()
+    assert "IsFrozenBar" in out.columns
+    assert "TurnoverINR" in out.columns
+    assert bool(out["IsFrozenBar"].iloc[0]) is True
+    assert bool(out["IsFrozenBar"].iloc[1]) is False
+    assert out["TurnoverINR"].iloc[0] == pytest.approx(100.0 * 1000)
+
+
+def test_turnover_prefers_the_exchange_figure_over_a_derived_one(tmp_path: Path) -> None:
+    con = duckdb.connect()
+    con.execute("SET enable_progress_bar=false")
+    source = tmp_path / "src.parquet"
+    frame = _frame(3)
+    frame["Turnover"] = [12345.0, 23456.0, 34567.0]
+    _write_parquet(source, frame)
+
+    select = publish._normalised_select(con, source)
+    out = con.execute(f"SELECT * FROM ({select}) ORDER BY Date").fetchdf()
+    assert list(out["TurnoverINR"]) == pytest.approx([12345.0, 23456.0, 34567.0])
+
+
+def test_changing_the_published_format_rewrites_every_year(tmp_path: Path) -> None:
+    """A year is reused when its SOURCE is unchanged - which says nothing about whether the
+    PUBLISHER changed. Adding two columns produced a run that reported NO_CHANGE and left
+    every past year on the old schema. The format stamp is what stops that."""
+    con = duckdb.connect()
+    con.execute("SET enable_progress_bar=false")
+    source = tmp_path / "store" / "src.parquet"
+    _write_parquet(source, _frame(5))
+    root = tmp_path / "published"
+    spec = publish.YearSource("nifty500", 2024, source)
+
+    first = publish._write_year(con, spec, root, active_year=2026)
+    assert first["format_version"] == publish.PUBLISH_FORMAT_VERSION
+
+    # Same source, same files, but published by an older format.
+    stale = dict(first, format_version="older-format")
+    second = publish._write_year(con, spec, root, {"nifty500:2024": stale}, active_year=2026)
+    assert second["reused_unchanged"] is False
+    assert second["format_version"] == publish.PUBLISH_FORMAT_VERSION

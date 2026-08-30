@@ -308,6 +308,31 @@ To get one back, delete that year's Parquet file too; the next run rebuilds both
 
 Run it from inside this folder.
 
+## 8b. Could you actually have traded it?
+
+Corporate actions in this dataset are clean — every split, bonus and face-value change in the
+official NSE archive has been checked against the price series and applied. So the remaining
+way to get a wrong backtest is subtler: **the price is correct and nobody could have traded at
+it.**
+
+Two columns are provided so you can filter for your own position size:
+
+- **`IsFrozenBar`** — `true` when open = high = low = close. The session had no intraday range
+  at all: a circuit limit, or a single trade. If your backtest fills anywhere other than that
+  one price on such a bar, it is inventing a fill.
+- **`TurnoverINR`** — the session's traded value in rupees. A stock turning over a lakh a day
+  cannot absorb a real position, and your own order would have moved the price.
+
+`DATA_QUALITY_REPORT.md` carries the measured shares for both universes. As a rough guide:
+roughly 0.2% of research-eligible rows are frozen bars, and single-digit percentages fall
+below Rs 10 lakh of daily turnover — higher in `nifty750`, which reaches further down the
+size curve.
+
+**These rows are reported, never removed.** They are real liquidity characteristics of Indian
+mid and small caps, not data errors, and deleting them would quietly narrow the universe and
+flatter your results. Filtering is your decision, and it should match the capital you intend
+to deploy.
+
 ## 9. What NOT to assume
 
 1. **Do not assume the price files are the universe.** They are the superset. See section 2.
@@ -322,6 +347,7 @@ Run it from inside this folder.
 8. **Do not assume a stale-looking last date means the data is broken.** See section 10.
 9. **Do not assume a missing CSV means missing data.** The Parquet is the dataset. See
    section 7.
+10. **Do not assume every eligible row was tradeable at your size.** See section 8b.
 
 ## 10. How this stays current, and what it survives
 
@@ -496,6 +522,17 @@ COLUMN_NOTES: dict[str, tuple[str, str]] = {
     "CorporateActionPriceFactor": ("ratio", "Cumulative price adjustment factor."),
     "CorporateActionVolumeFactor": ("ratio", "Cumulative volume adjustment factor."),
     "Year": ("—", "Calendar year. Redundant with Date; kept for convenience."),
+    "IsFrozenBar": (
+        "bool",
+        "**Tradability.** True when open = high = low = close: the session had no intraday "
+        "range at all, meaning a circuit limit or a single trade. A fill at any other price "
+        "on such a bar is invented.",
+    ),
+    "TurnoverINR": (
+        "INR",
+        "**Tradability.** Traded value for the session. Filter on this to match your own "
+        "position size; a stock turning over a lakh a day cannot absorb a real order.",
+    ),
 }
 
 
