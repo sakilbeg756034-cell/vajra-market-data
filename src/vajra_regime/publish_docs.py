@@ -106,6 +106,10 @@ def start_here(manifest: dict[str, Any], quality: dict[str, Any] | None) -> str:
     else:
         csv_status = "In this copy, every year has both a Parquet file and a CSV."
 
+    identity = manifest.get("identity", {})
+    multi_isin = identity.get("symbols_with_multiple_isins", "several")
+    multi_symbol = identity.get("isins_with_multiple_symbols", "several")
+
     quality_line = (
         "See `DATA_QUALITY_REPORT.md` for the full verification run."
         if quality
@@ -234,8 +238,15 @@ which is more securities than 750. Filter it through the membership file. Always
 Full column-by-column detail is in `DATA_DICTIONARY.md`. The short version:
 
 - One row = one security on one trading session.
-- `Date` is a `DATE`. `Symbol` is the NSE trading symbol **on that date** — it changes when a
-  company renames. `ISIN` is stable; **join on ISIN, group on ISIN, never on Symbol.**
+- `Date` is a `DATE`. `Symbol` is the NSE trading symbol **on that date**. `ISIN` is the
+  identity; **join on ISIN, group on ISIN, never on Symbol.**
+
+  This is not a stylistic preference. In this dataset **{multi_isin} symbols carry more than
+  one ISIN** over time — a face-value change issues a new one — and **{multi_symbol} ISINs
+  carry more than one symbol**, from renames. Computing a return with `LAG(Close)` partitioned
+  by symbol rather than ISIN crosses those boundaries and invents moves: doing exactly that
+  produced a fictitious +428% day for ADANIPOWER while checking this dataset. No date has the
+  same `(Date, ISIN)` or `(Date, Symbol)` twice, so partitioning by ISIN is unambiguous.
 - `Open`/`High`/`Low`/`Close` are in **INR**, adjusted (section 5).
 - `Volume` is share count, adjusted alongside price.
 - `Raw*` columns are the unadjusted exchange values, kept so you can audit any adjustment.
@@ -333,10 +344,29 @@ mid and small caps, not data errors, and deleting them would quietly narrow the 
 flatter your results. Filtering is your decision, and it should match the capital you intend
 to deploy.
 
+## 8c. What `Close` actually is, and which series you are holding
+
+**`Close` is NSE's official closing price** — a volume-weighted average of the final half
+hour of trading — **not the last traded price.** Every raw price in this dataset has been
+compared against NSE's own published bhavcopy and matches to within half a paisa.
+
+This matters when you compare against another data provider. Most free sources carry the
+*last traded* price, so on a volatile day they will differ from this dataset by tenths of a
+percent. That is a difference of definition, not an error on either side. If your backtest
+assumes it fills at the last trade, model that yourself; `Close` here is the settlement-style
+figure.
+
+**The `Series` column is not decoration.** Rows marked `EQ` are the ordinary rolling segment.
+Rows marked **`BE` are the trade-to-trade segment**, where intraday trading is prohibited and
+every trade must be settled by delivery. A backtest that buys and sells a `BE` security within
+the same session is modelling something the exchange does not permit. Other series appear too.
+Filter on `Series` if your strategy trades intraday.
+
 ## 9. What NOT to assume
 
 1. **Do not assume the price files are the universe.** They are the superset. See section 2.
-2. **Do not join or group on `Symbol` across time.** Symbols get reused and renamed. Use `ISIN`.
+2. **Do not join or group on `Symbol` across time.** {multi_isin} symbols in this dataset
+   carry more than one ISIN. Use `ISIN`. See section 4.
 3. **Do not compare returns to a Total Return Index.** No dividends. See section 5.
 4. **Do not treat `PRICE_DATA_ONLY` years as backtestable.** See section 1.
 5. **Do not assume every session has every member.** A member with no trade that day has no
@@ -348,6 +378,8 @@ to deploy.
 9. **Do not assume a missing CSV means missing data.** The Parquet is the dataset. See
    section 7.
 10. **Do not assume every eligible row was tradeable at your size.** See section 8b.
+11. **Do not assume `Close` is the last traded price, or that every row is intraday-tradeable.**
+    See section 8c.
 
 ## 10. How this stays current, and what it survives
 
@@ -450,7 +482,12 @@ COLUMN_NOTES: dict[str, tuple[str, str]] = {
     "MembershipSymbol": ("—", "Symbol as it appeared in the index constituent file that day."),
     "ISIN": ("—", "Stable security identity. Join and group on this."),
     "ExchangeISIN": ("—", "ISIN as printed in the exchange bhavcopy, kept for cross-checking."),
-    "Series": ("—", "NSE series code. EQ is the ordinary equity segment."),
+    "Series": (
+        "—",
+        "NSE series code. `EQ` is the ordinary rolling segment. **`BE` is trade-to-trade**: "
+        "intraday trading is prohibited and every trade settles by delivery, so a same-session "
+        "round trip is not possible. Filter on this if your strategy trades intraday.",
+    ),
     "Open": ("INR", "Adjusted opening price."),
     "High": ("INR", "Adjusted session high."),
     "Low": ("INR", "Adjusted session low."),

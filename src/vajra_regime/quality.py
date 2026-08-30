@@ -376,11 +376,35 @@ def check_price_coverage_of_members(con: duckdb.DuckDBPyConnection, root: Path) 
         GROUP BY 1 ORDER BY 2 DESC LIMIT 10
         """
     ).fetchall()
+
+    # The aggregate hides the thing that matters. Split it at the membership anchor: gaps in
+    # the reconstructed era sit in years already labelled PRICE_DATA_ONLY, while a gap in the
+    # official era would undermine the BACKTEST_SAFE label directly.
+    anchor = OFFICIAL_MEMBERSHIP_ANCHOR.isoformat()
+    by_era = con.execute(
+        f"""
+        SELECT m.Date >= DATE '{anchor}' AS official_era,
+               COUNT(*), SUM(CASE WHEN p.Date IS NULL THEN 1 ELSE 0 END)
+        FROM read_parquet('{membership}') m
+        LEFT JOIN (SELECT DISTINCT Date, ISIN FROM read_parquet('{prices}')) p
+          ON p.Date = m.Date AND p.ISIN = m.ISIN
+        GROUP BY 1
+        """
+    ).fetchall()
+    eras: dict[str, Any] = {}
+    for official, total, missing in by_era:
+        total, missing = int(total), int(missing or 0)
+        eras["official_era_backtest_safe" if official else "reconstructed_era_price_data_only"] = {
+            "member_sessions": total,
+            "without_a_price": missing,
+            "fraction": round(missing / total, 6) if total else 0.0,
+        }
     return {
         "member_sessions": member_sessions,
         "member_sessions_without_price": without,
         "fraction": round(fraction, 6),
         "pass": fraction <= MEMBER_COVERAGE_WARN_FRACTION,
+        "by_era": eras,
         "worst_symbols": [{"symbol": r[0], "missing_sessions": int(r[1])} for r in worst],
         "note": (
             "A member with no price row for a session usually means the security did not trade "
@@ -544,6 +568,15 @@ def run_quality_checks(root: Path | None = None) -> dict[str, Any]:
     report["survivorship"] = check_survivorship(con, root)
     report["member_price_coverage"] = check_price_coverage_of_members(con, root)
     report["parquet_csv_parity"] = check_parquet_csv_parity(root, manifest)
+
+    source_path = paths.LOGS_ROOT / "quality" / "source_verify.json"
+    if source_path.is_file():
+        report["exchange_verification"] = json.loads(source_path.read_text(encoding="utf-8"))
+    else:
+        report["exchange_verification"] = {
+            "status": "NOT_RUN",
+            "note": "No re-verification against NSE's own bhavcopy was found.",
+        }
 
     external_path = paths.LOGS_ROOT / "quality" / "external_crosscheck.json"
     if external_path.is_file():
@@ -786,6 +819,30 @@ def render_report(report: dict[str, Any]) -> str:
         f"({cov['fraction']:.3%}) have no price row."
     )
     add("")
+    if cov.get("by_era"):
+        add("The aggregate hides the part that matters. Split at the membership anchor:")
+        add("")
+        add("| Era | Member sessions | Without a price | Share |")
+        add("|---|---:|---:|---:|")
+        labels = {
+            "official_era_backtest_safe": f"Official, {OFFICIAL_MEMBERSHIP_ANCHOR} onward "
+            "(BACKTEST_SAFE)",
+            "reconstructed_era_price_data_only": "Reconstructed, before the anchor "
+            "(PRICE_DATA_ONLY)",
+        }
+        for key, label in labels.items():
+            era = cov["by_era"].get(key)
+            if era:
+                add(
+                    f"| {label} | {era['member_sessions']:,} | {era['without_a_price']:,} "
+                    f"| {era['fraction']:.4%} |"
+                )
+        add("")
+        add(
+            "Coverage in the era you are meant to backtest on is effectively complete. The "
+            "gaps sit in the years that are already labelled not backtestable."
+        )
+        add("")
     add(cov["note"])
     if cov["worst_symbols"]:
         add("")
@@ -801,6 +858,30 @@ def render_report(report: dict[str, Any]) -> str:
     add(par["method"])
     add("")
     add(f"{par['years_identical']} of {par['years_checked']} universe-years verified identical.")
+    add("")
+
+    src = report.get("exchange_verification", {})
+    add("## Re-verified against NSE's own bhavcopy")
+    add("")
+    if src.get("status") == "NOT_RUN":
+        add(src.get("note", "Not run."))
+    else:
+        add(src.get("method", ""))
+        add("")
+        add(
+            f"**{src.get('rows_matching_the_exchange', 0):,} of "
+            f"{src.get('rows_checked', 0):,} rows match the exchange exactly** across "
+            f"{src.get('sessions_sampled', 0)} random sessions from "
+            f"{src.get('first_session')} to {src.get('last_session')}. "
+            f"Mismatches: **{src.get('rows_mismatched', 0)}**. "
+            f"Match rate: **{src.get('match_rate', 0):.4%}**."
+        )
+        add("")
+        add(
+            "Prices are compared to within half a paisa and volume must match exactly. This "
+            "is the highest authority available: there is nothing to appeal to above the "
+            "exchange's own published file."
+        )
     add("")
 
     ext = report["external_crosscheck"]

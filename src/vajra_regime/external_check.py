@@ -62,16 +62,37 @@ def _sql(path: Path) -> str:
 def _our_returns(
     con: duckdb.DuckDBPyConnection, root: Path, symbol: str, start: date, end: date
 ) -> dict[date, float]:
+    """Returns for one symbol, computed strictly inside one ISIN.
+
+    146 symbols in this dataset carry more than one ISIN over time, because a face-value
+    change issues a new one. Lagging by symbol alone therefore computes a return *across* an
+    identity boundary and invents a move - it reported ADANIPOWER at +428% on 2023-03-31,
+    which is an artefact of this query, not of the data. The identity with the most sessions
+    in the window is the one the outside source will be carrying.
+
+    Only research-eligible rows are compared, because those are the only rows a backtest
+    uses. Comparing the excluded ones measures data the dataset itself says not to trust, and
+    produces a disagreement that means nothing.
+    """
     glob = _sql(root / "nifty500" / "parquet" / "nifty500_*.parquet")
-    rows = con.execute(
+    isin_row = con.execute(
         f"""
-        SELECT Date, Close,
-               LAG(Close) OVER (ORDER BY Date) AS Prev
-        FROM read_parquet('{glob}')
-        WHERE Symbol = ? AND Date BETWEEN ? AND ?
-        ORDER BY Date
+        SELECT ISIN FROM read_parquet('{glob}')
+        WHERE Symbol = ? AND Date BETWEEN ? AND ? AND ISIN IS NOT NULL
+        GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 1
         """,
         [symbol, start, end],
+    ).fetchone()
+    if not isin_row:
+        return {}
+    rows = con.execute(
+        f"""
+        SELECT Date, Close, LAG(Close) OVER (ORDER BY Date) AS Prev
+        FROM read_parquet('{glob}')
+        WHERE ISIN = ? AND Date BETWEEN ? AND ? AND IsResearchEligible
+        ORDER BY Date
+        """,
+        [isin_row[0], start, end],
     ).fetchall()
     return {
         r[0]: r[1] / r[2] - 1.0

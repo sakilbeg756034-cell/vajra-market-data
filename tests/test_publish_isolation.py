@@ -43,7 +43,8 @@ def test_only_the_publisher_writes_to_the_published_root() -> None:
     # The publisher writes it; the verification modules read it back on purpose, which is the
     # whole point of checking the published files rather than the build pipeline's claims.
     allowed = {"publish.py", "publish_docs.py", "publish_runner.py", "quality.py",
-               "quality_runner.py", "external_check.py", "paths.py", "config.py"}
+               "quality_runner.py", "external_check.py", "source_verify.py", "paths.py",
+               "config.py"}
     offenders = []
     for path in (REPO_ROOT / "src" / "vajra_regime").rglob("*.py"):
         if path.name in allowed:

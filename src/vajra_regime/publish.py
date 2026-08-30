@@ -760,8 +760,29 @@ def build_manifest(
                 files.append({**year["csv"], "kind": "OHLCV_CSV"})
     files.extend(extra_records)
 
+    # Identity facts a reader needs before deciding what to join on.
+    n500_glob = _sql(root / "nifty500" / "parquet" / "nifty500_*.parquet")
+    identity = connection.execute(
+        f"""
+        SELECT
+          (SELECT COUNT(*) FROM (SELECT Symbol FROM read_parquet('{n500_glob}')
+             WHERE ISIN IS NOT NULL GROUP BY 1 HAVING COUNT(DISTINCT ISIN) > 1)),
+          (SELECT COUNT(*) FROM (SELECT ISIN FROM read_parquet('{n500_glob}')
+             WHERE ISIN IS NOT NULL GROUP BY 1 HAVING COUNT(DISTINCT Symbol) > 1))
+        """
+    ).fetchone()
+
     manifest: dict[str, Any] = {
         "manifest_version": PUBLISH_VERSION,
+        "identity": {
+            "symbols_with_multiple_isins": int(identity[0] or 0),
+            "isins_with_multiple_symbols": int(identity[1] or 0),
+            "note": (
+                "A face-value change issues a new ISIN and a rename changes the symbol. Join "
+                "and group on ISIN; lagging by symbol crosses identity boundaries and invents "
+                "returns."
+            ),
+        },
         "generated_at_utc": datetime.now(UTC).isoformat(),
         "published_root": str(root),
         "latest_session": max(u["last_date"] for u in universes.values()),

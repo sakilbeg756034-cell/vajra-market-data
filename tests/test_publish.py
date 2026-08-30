@@ -619,3 +619,54 @@ def test_changing_the_published_format_rewrites_every_year(tmp_path: Path) -> No
     second = publish._write_year(con, spec, root, {"nifty500:2024": stale}, active_year=2026)
     assert second["reused_unchanged"] is False
     assert second["format_version"] == publish.PUBLISH_FORMAT_VERSION
+
+
+# ------------------------------------------------------------- exchange re-verification
+
+
+def test_exchange_rows_parses_both_bhavcopy_formats() -> None:
+    """NSE changed format in 2024. Both eras must parse, and series must be part of the key -
+    keying on symbol alone reported 89 trade-to-trade rows as missing from the exchange when
+    they were there under BE all along."""
+    import csv as _csv
+    import io as _io
+    import zipfile as _zip
+    from datetime import date as _date
+    from unittest.mock import patch
+
+    from vajra_regime import source_verify
+
+    def zipped(header: str, row: str) -> bytes:
+        buffer = _io.BytesIO()
+        with _zip.ZipFile(buffer, "w") as archive:
+            archive.writestr("bhav.csv", f"{header}\n{row}\n")
+        return buffer.getvalue()
+
+    legacy = zipped(
+        "SYMBOL,SERIES,OPEN,HIGH,LOW,CLOSE,LAST,PREVCLOSE,TOTTRDQTY,TOTTRDVAL,TIMESTAMP",
+        "ACME,BE,10,12,9,11,10.5,10,1000,11000,22-JAN-2009",
+    )
+    with patch.object(source_verify, "_fetch", return_value=legacy):
+        rows = source_verify.exchange_rows(_date(2009, 1, 22))
+    assert rows == {("ACME", "BE"): {"Open": 10.0, "High": 12.0, "Low": 9.0,
+                                     "Close": 11.0, "Volume": 1000.0}}
+
+    udiff = zipped(
+        "TradDt,TckrSymb,SctySrs,OpnPric,HghPric,LwPric,ClsPric,TtlTradgVol",
+        "2025-01-02,ACME,EQ,10,12,9,11,1000",
+    )
+    with patch.object(source_verify, "_fetch", return_value=udiff):
+        rows = source_verify.exchange_rows(_date(2025, 1, 2))
+    assert ("ACME", "EQ") in rows
+    assert rows[("ACME", "EQ")]["Close"] == 11.0
+    assert _csv  # keeps the import meaningful
+
+
+def test_exchange_rows_returns_none_when_the_source_is_unreachable() -> None:
+    from datetime import date as _date
+    from unittest.mock import patch
+
+    from vajra_regime import source_verify
+
+    with patch.object(source_verify, "_fetch", return_value=None):
+        assert source_verify.exchange_rows(_date(2020, 1, 1)) is None
