@@ -12,6 +12,30 @@ face-value split of 2009-07-24 was never applied to the pre-split history, leavi
 one-day "return" in a large-cap stock that was still flagged research-eligible. ALLCARGO's
 1:5 face-value split of 2009-11-19 had the same problem, at -80.7%.
 
+A third failure mode, found on 2026-09-02
+----------------------------------------
+Both detections below start ``FROM _events r JOIN _prices p ON p.Date = r.ExDate``. They are
+anchored to an ex-date, so a price break with **no corporate action at all** is not merely
+unrepaired - it is never looked at. It passes through research-eligible with nothing recorded.
+
+That is not hypothetical. On 2026-01-01, fourteen securities broke at once, each by exactly the
+reciprocal of its own later-2026 bonus factor: ZFCVINDIA x5.94 against a 5:1 bonus on 06-24,
+CUPID x5.07 against a 4:1 on 03-09, INFOBEAN x3.95 against a 3:1 on 02-27, ECLERX x2.05 against
+a 1:1 on 03-13, TRENT x1.51 against a 1:2 on 06-04. Fourteen unrelated companies do not produce
+ratios that line up with their own pending bonuses by chance, and the breaks land on the first
+session of the year rather than on any ex-date. 2024 has three of these, 2026 has fourteen, and
+every other year has none - the signature of a year-boundary problem upstream in the adjusted
+master, not of fourteen real consolidations.
+
+The root cause is upstream and is not fixed here. What is fixed here is that the module no
+longer walks past it in silence.
+
+Why these are excluded and not rescaled: the ratio is only inferable from the break itself, and
+this module's own rule is that rescaling on a guess is worse than leaving the row flagged. Both
+readings of the CUPID evidence - a real consolidation missing from the archive, or a year file
+adjusted on a different basis - imply opposite corrections, and picking one would silently
+falsify a whole year for the securities involved.
+
 Two failure modes, two different responses
 ------------------------------------------
 **Mechanical events** - splits, bonuses, face-value changes. These have an exact known ratio.
@@ -61,6 +85,23 @@ REPAIRED_MOVE_TOLERANCE = 0.20
 NON_MECHANICAL_MOVE_THRESHOLD = 0.35
 
 EXCLUSION_REASON = "NON_MECHANICAL_CORPORATE_ACTION_PRICE_BREAK_NOT_A_RETURN"
+
+# A break this large with no corporate action anywhere near it is not a return. NSE price
+# bands top out at 20%; a one-day move past 50% that is not a corporate action essentially
+# does not happen. Measured over the whole published history at several thresholds: 50% keeps
+# 573 rows across both universes, 465 of them the first print after a suspension of 100+ days,
+# and the 63 without a gap cluster on round ratios - 2.0 eleven times, 0.4 thirteen, 0.3 ten,
+# 0.2 seven, 0.5 six - which is what corporate actions look like, not what markets look like.
+# Loosening this to 35% would pull in 1,221 rows and start catching real moves.
+UNEXPLAINED_MOVE_THRESHOLD = 0.50
+
+# NSE files ex-dates a day or two off often enough, and the print can land either side of one.
+# A break within this many calendar days of ANY archived event for that security - dividend,
+# AGM, anything - is treated as explained and left alone. Deliberately generous: the cost of
+# missing one break is small, the cost of excluding a real return is not.
+UNEXPLAINED_EVENT_WINDOW_DAYS = 5
+
+UNEXPLAINED_REASON = "UNEXPLAINED_PRICE_BREAK_NO_CORPORATE_ACTION_FOUND"
 REPAIR_NOTE = "MECHANICAL_ADJUSTMENT_REPAIRED_BY_ENGINE"
 
 
@@ -180,7 +221,12 @@ def year_files(universe: str) -> dict[int, Path]:
 def detect(con: duckdb.DuckDBPyConnection, spec: UniverseSpec) -> dict[str, list[dict[str, Any]]]:
     paths_for_universe = list(year_files(spec.name).values())
     if not paths_for_universe:
-        return {"mechanical": [], "non_mechanical": [], "unrepairable_residual": []}
+        return {
+            "mechanical": [],
+            "non_mechanical": [],
+            "unrepairable_residual": [],
+            "unexplained": [],
+        }
     files = ", ".join(f"'{_sql(p)}'" for p in paths_for_universe)
     _parsed_events(con)
     con.execute(
@@ -231,6 +277,30 @@ def detect(con: duckdb.DuckDBPyConnection, spec: UniverseSpec) -> dict[str, list
         ORDER BY r.ExDate
         """
     ).fetchall()
+    # The third bucket: a break with no event anywhere near it. This one is anchored to the
+    # PRICES, not to the event ledger, which is the whole point - it is the only query here
+    # that can see a break the archive knows nothing about. NOT EXISTS rather than an anti-join
+    # so that a security with many events cannot multiply rows.
+    unexplained = con.execute(
+        f"""
+        SELECT DISTINCT p.Date, p.Symbol, p.ISIN, p.Ret
+        FROM _prices p
+        WHERE p.Ret IS NOT NULL
+          AND abs(p.Ret) > {UNEXPLAINED_MOVE_THRESHOLD}
+          -- Already recorded on a previous run; re-flagging would rewrite every year file
+          -- daily and defeat the publisher's unchanged-year reuse.
+          AND (p.Reason IS NULL OR p.Reason <> '{UNEXPLAINED_REASON}')
+          AND (p.Reason IS NULL OR p.Reason <> '{EXCLUSION_REASON}')
+          AND NOT EXISTS (
+              SELECT 1 FROM _events r
+              WHERE (r.ISIN = p.ISIN OR r.Symbol = p.Symbol)
+                AND abs(date_diff('day', r.ExDate, p.Date))
+                    <= {UNEXPLAINED_EVENT_WINDOW_DAYS}
+          )
+        ORDER BY p.Date
+        """
+    ).fetchall()
+
     seen: set[tuple[str, str]] = set()
     deduped = []
     for row in mechanical:
@@ -254,6 +324,16 @@ def detect(con: duckdb.DuckDBPyConnection, spec: UniverseSpec) -> dict[str, list
     mechanical = repairable
 
     return {
+        "unexplained": [
+            {
+                "ex_date": str(r[0]),
+                "symbol": r[1],
+                "isin": r[2],
+                "observed_move": round(float(r[3]), 6),
+                "handling": "EXCLUDED_NO_CORPORATE_ACTION_EXPLAINS_THIS_BREAK",
+            }
+            for r in unexplained
+        ],
         "unrepairable_residual": [
             {
                 "ex_date": str(r[0]),
@@ -360,6 +440,7 @@ def _rewrite_year(
     *,
     mechanical: list[dict[str, Any]],
     non_mechanical: list[dict[str, Any]],
+    unexplained: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     columns = [
         row[0]
@@ -375,6 +456,7 @@ def _rewrite_year(
     volume_factor = _factor_expression(mechanical, price=False)
     repaired_keys = _key_list(mechanical)
     excluded_keys = _key_list(non_mechanical)
+    unexplained_keys = _key_list(unexplained or [])
 
     projections: list[str] = []
     for name in columns:
@@ -395,10 +477,16 @@ def _rewrite_year(
                 f"{_return_patch_expression(mechanical, spec.return_column)} AS {quoted}"
             )
         elif name == spec.eligibility_column:
-            projections.append(f"CASE WHEN {excluded_keys} THEN FALSE ELSE {quoted} END AS {quoted}")
-        elif name == spec.reason_column:
             projections.append(
-                f"CASE WHEN {excluded_keys} THEN '{EXCLUSION_REASON}' ELSE {quoted} END AS {quoted}"
+                f"CASE WHEN {excluded_keys} OR {unexplained_keys} THEN FALSE "
+                f"ELSE {quoted} END AS {quoted}"
+            )
+        elif name == spec.reason_column:
+            # Order matters: a row that is both is a known corporate action first.
+            projections.append(
+                f"CASE WHEN {excluded_keys} THEN '{EXCLUSION_REASON}' "
+                f"WHEN {unexplained_keys} THEN '{UNEXPLAINED_REASON}' "
+                f"ELSE {quoted} END AS {quoted}"
             )
         elif spec.classification_column and name == spec.classification_column:
             projections.append(
@@ -435,6 +523,8 @@ def repair_universe(
             "non_mechanical_count": 0,
             "unapplied_mechanical_events": [],
             "non_mechanical_price_breaks": [],
+            "unexplained_price_breaks": [],
+            "unexplained_count": 0,
             "files_rewritten": [],
             "verified": None,
         }
@@ -443,15 +533,18 @@ def repair_universe(
     # An event whose ratio does not explain the move is handled like a demerger: nothing is
     # rescaled, the boundary row is simply marked not research-eligible.
     non_mechanical = found["non_mechanical"] + found.get("unrepairable_residual", [])
+    unexplained = found.get("unexplained", [])
     entry: dict[str, Any] = {
         "unapplied_mechanical_events": mechanical,
         "non_mechanical_price_breaks": non_mechanical,
         "unrepairable_residual": found.get("unrepairable_residual", []),
+        "unexplained_price_breaks": unexplained,
         "mechanical_count": len(mechanical),
         "non_mechanical_count": len(non_mechanical),
+        "unexplained_count": len(unexplained),
         "files_rewritten": [],
     }
-    if not mechanical and not non_mechanical:
+    if not mechanical and not non_mechanical and not unexplained:
         entry["action"] = "NO_CHANGE"
         entry["verified"] = True
         return entry
@@ -478,6 +571,7 @@ def repair_universe(
                 touched.add(year)
         touched.add(ex_year)  # the boundary row's stored return has to be patched
     touched.update(int(e["ex_date"][:4]) for e in non_mechanical)
+    touched.update(int(e["ex_date"][:4]) for e in unexplained)
 
     for year in sorted(touched):
         path = files.get(year)
@@ -485,13 +579,19 @@ def repair_universe(
             continue
         entry["files_rewritten"].append(
             _rewrite_year(
-                con, path, spec, mechanical=mechanical, non_mechanical=non_mechanical
+                con,
+                path,
+                spec,
+                mechanical=mechanical,
+                non_mechanical=non_mechanical,
+                unexplained=unexplained,
             )
         )
 
     after = detect(con, spec)
     entry["residual_mechanical_after_repair"] = after["mechanical"]
     entry["residual_non_mechanical_after_repair"] = after["non_mechanical"]
+    entry["residual_unexplained_after_repair"] = after.get("unexplained", [])
     entry["verified"] = not after["mechanical"]
     entry["action"] = "REPAIRED"
     if after["mechanical"]:

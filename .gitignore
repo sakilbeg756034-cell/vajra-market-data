@@ -45,3 +45,4 @@ artifacts/
 # OS files
 .DS_Store
 Thumbs.db
+.backup_before_claude/
