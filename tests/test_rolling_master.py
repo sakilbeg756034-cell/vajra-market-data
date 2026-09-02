@@ -35,11 +35,14 @@ def _seed_database(config: SimpleNamespace) -> None:
             """
             CREATE TABLE clean_daily AS
             SELECT * FROM (VALUES
-                (DATE '2025-12-30', 2025, 'AAA', 'INE000A01001', 100.0, 101.0, 99.0, 100.0, 1000::BIGINT,
+                -- AAA's legacy rows arrive from EOD2 with the 2026-01-02 bonus ALREADY
+                -- applied: 50.0, not the 100.0 it traded at. That is what the real feed
+                -- does, and it is why these rows must not be adjusted a second time.
+                (DATE '2025-12-30', 2025, 'AAA', 'INE000A01001', 50.0, 50.5, 49.5, 50.0, 2000::BIGINT,
                  10.0, 100.0, 500.0, 100000.0, NULL::DOUBLE, NULL::DOUBLE, NULL::BIGINT, 1, 100000.0, 1::BIGINT,
                  FALSE, FALSE, FALSE, TRUE),
-                (DATE '2025-12-31', 2025, 'AAA', 'INE000A01001', 100.0, 101.0, 99.0, 100.0, 1000::BIGINT,
-                 10.0, 100.0, 500.0, 100000.0, 100.0, 0.0, 1::BIGINT, 2, 100000.0, 2::BIGINT,
+                (DATE '2025-12-31', 2025, 'AAA', 'INE000A01001', 50.0, 50.5, 49.5, 50.0, 2000::BIGINT,
+                 10.0, 100.0, 500.0, 100000.0, 50.0, 0.0, 1::BIGINT, 2, 100000.0, 2::BIGINT,
                  FALSE, FALSE, FALSE, TRUE),
                 (DATE '2025-12-31', 2025, 'BBB', 'INE000B01001', 200.0, 202.0, 198.0, 200.0, 500::BIGINT,
                  5.0, 100.0, 250.0, 100000.0, NULL::DOUBLE, NULL::DOUBLE, NULL::BIGINT, 1, 100000.0, 1::BIGINT,
@@ -87,7 +90,27 @@ def _seed_database(config: SimpleNamespace) -> None:
         )
 
 
-def test_rolling_master_back_adjusts_bonus_and_quarantines_rights(tmp_path: Path) -> None:
+def test_rolling_master_adjusts_only_the_live_half_and_quarantines_rights(
+    tmp_path: Path,
+) -> None:
+    """The factor belongs to the as-traded half only, and the seam must not move.
+
+    Two sources meet at LIVE_START: EOD2's legacy feed, which is already split-
+    and bonus-adjusted, and NSE's bhavcopy, which is as-traded. Applying the
+    factor to both adjusts the legacy half twice, and because the live half is
+    adjusted once the two stop agreeing exactly at the boundary.
+
+    That is not hypothetical. On 2026-09-02 fourteen securities carried a break
+    on 2026-01-01, each of size exactly the reciprocal of its own pending-2026
+    bonus - ZFCVINDIA x5.94 against a 5:1, CUPID x5.07 against a 4:1, ECLERX
+    x2.05 against a 1:1 - while RELIANCE and INFY, which had no 2026 action,
+    were untouched. It stayed invisible for years because every row used to come
+    from the one feed, and a uniform extra factor over a whole series changes no
+    return and leaves no seam to see.
+
+    So this asserts the property whose failure costs money - continuity across
+    the boundary - rather than a transformation.
+    """
     config = _config(tmp_path)
     _seed_database(config)
 
@@ -108,6 +131,12 @@ def test_rolling_master_back_adjusts_bonus_and_quarantines_rights(tmp_path: Path
         ex_return = connection.execute(
             "SELECT Return1D FROM clean_daily WHERE ISIN = 'INE000A01001' AND Date = DATE '2026-01-02'"
         ).fetchone()[0]
+        live_pre_ex_close = connection.execute(
+            "SELECT Close FROM clean_daily WHERE ISIN = 'INE000A01001' AND Date = DATE '2026-01-01'"
+        ).fetchone()[0]
+        seam_return = connection.execute(
+            "SELECT Return1D FROM clean_daily WHERE ISIN = 'INE000A01001' AND Date = DATE '2026-01-01'"
+        ).fetchone()[0]
         rights_quarantine = connection.execute(
             "SELECT CorporateActionQuarantineFlag FROM clean_daily "
             "WHERE ISIN = 'INE000B01001' AND Date = DATE '2026-01-02'"
@@ -116,8 +145,14 @@ def test_rolling_master_back_adjusts_bonus_and_quarantines_rights(tmp_path: Path
             "SELECT COUNT(*) FROM (SELECT Date, ISIN, COUNT(*) n FROM clean_daily GROUP BY Date, ISIN HAVING n > 1)"
         ).fetchone()[0]
 
+    # Legacy comes out exactly as the feed supplied it.
     assert math.isclose(historical_close, 50.0, rel_tol=0, abs_tol=1e-10)
     assert historical_volume == 2000
+    # The live pre-ex row is as-traded and does need the factor: 100.0 -> 50.0.
+    assert math.isclose(live_pre_ex_close, 50.0, rel_tol=0, abs_tol=1e-10)
+    # And therefore the two halves meet without a step. This is the assertion
+    # that would have caught the 2026-01-01 breaks.
+    assert math.isclose(seam_return, 0.0, rel_tol=0, abs_tol=1e-10)
     assert math.isclose(ex_return, 0.02, rel_tol=0, abs_tol=1e-9)
     assert rights_quarantine is True
     assert duplicates == 0
@@ -136,6 +171,7 @@ def test_rolling_master_back_adjusts_bonus_and_quarantines_rights(tmp_path: Path
 
 
 def test_rerun_is_deterministic_and_does_not_compound_bonus(tmp_path: Path) -> None:
+    """Rebuilding twice must not apply the factor twice to the live half."""
     config = _config(tmp_path)
     _seed_database(config)
 
@@ -143,10 +179,16 @@ def test_rerun_is_deterministic_and_does_not_compound_bonus(tmp_path: Path) -> N
     rebuild_rolling_clean_data(config)
 
     with duckdb.connect(str(config.environment.duckdb_path), read_only=True) as connection:
-        close = connection.execute(
+        legacy_close = connection.execute(
             "SELECT Close FROM clean_daily WHERE ISIN = 'INE000A01001' AND Date = DATE '2025-12-31'"
+        ).fetchone()[0]
+        live_close = connection.execute(
+            "SELECT Close FROM clean_daily WHERE ISIN = 'INE000A01001' AND Date = DATE '2026-01-01'"
         ).fetchone()[0]
         rows = connection.execute("SELECT COUNT(*) FROM clean_daily").fetchone()[0]
 
-    assert math.isclose(close, 50.0, rel_tol=0, abs_tol=1e-10)
+    # Untouched however many times the build runs.
+    assert math.isclose(legacy_close, 50.0, rel_tol=0, abs_tol=1e-10)
+    # Adjusted once, not 100 -> 50 -> 25.
+    assert math.isclose(live_close, 50.0, rel_tol=0, abs_tol=1e-10)
     assert rows == 7
