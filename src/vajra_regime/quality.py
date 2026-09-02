@@ -513,6 +513,94 @@ def check_parquet_csv_parity(root: Path, manifest: dict[str, Any]) -> dict[str, 
     }
 
 
+UNEXPLAINED_MOVE_THRESHOLD = 0.50
+UNEXPLAINED_EVENT_WINDOW_DAYS = 5
+
+
+def check_unexplained_breaks(
+    con: duckdb.DuckDBPyConnection, root: Path, universe: str
+) -> dict[str, Any]:
+    """Did a price break with no corporate action behind it stay research-eligible?
+
+    `adjustment_sanity` above starts from the corporate-action ledger and looks at each
+    ex-date, so it can only see breaks that an event explains. A break with no event at all
+    is invisible to it - not merely unrepaired, never looked at.
+
+    That is how CUPID passed: +406.66% on 2026-01-01, nothing in the ledger within days of
+    it, IsResearchEligible still true, and this report still saying PASS. Thirteen other
+    securities carried the same break on the same session, each of size exactly the
+    reciprocal of its own pending-2026 bonus - the signature of the legacy half of the
+    master being adjusted twice (fixed in rolling_master.py on 2026-09-02).
+
+    So this check runs the other way round: start from the prices, find the impossible
+    moves, and ask whether anything explains them. NSE's price bands top out at 20%; a
+    one-day move past 50% with no event within a few days either side is a data fault, and
+    a data fault that is still eligible is one a strategy can act on.
+    """
+    g = _glob(root, universe)
+    ca = _sql(root / "corporate_actions" / "official_nse_corporate_actions_all.parquet")
+    # The two universes name their adjusted daily return differently, and deriving one
+    # here with LAG would be wrong anyway: nifty500 carries 587 (Date, ISIN) pairs on more
+    # than one row, so a window partitioned by ISIN alone steps between them and invents
+    # moves. Use whichever column the file itself publishes.
+    available = {
+        row[0]
+        for row in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{g}')").fetchall()
+    }
+    for candidate in ("Return1D", "AdjustedReturn1D"):
+        if candidate in available:
+            return_column = candidate
+            break
+    else:
+        return {
+            "pass": None,
+            "note": "No adjusted daily-return column found; check not run.",
+            "columns_seen": sorted(available)[:40],
+        }
+    rows = con.execute(
+        f"""
+        WITH p AS (
+            SELECT Date, Symbol, ISIN, "{return_column}" AS Return1D, IsResearchEligible
+            FROM read_parquet('{g}')
+            WHERE "{return_column}" IS NOT NULL
+              AND abs("{return_column}") > {UNEXPLAINED_MOVE_THRESHOLD}
+        ),
+        e AS (
+            SELECT ISIN, Symbol, CAST(ExDate AS DATE) AS ExDate
+            FROM read_parquet('{ca}') WHERE ExDate IS NOT NULL
+        )
+        SELECT p.Date, p.Symbol, p.ISIN, p.Return1D, p.IsResearchEligible
+        FROM p
+        WHERE NOT EXISTS (
+            SELECT 1 FROM e
+            WHERE (e.ISIN = p.ISIN OR e.Symbol = p.Symbol)
+              AND abs(date_diff('day', e.ExDate, p.Date)) <= {UNEXPLAINED_EVENT_WINDOW_DAYS}
+        )
+        ORDER BY abs(p.Return1D) DESC
+        """
+    ).fetchall()
+    still_eligible = [r for r in rows if r[4]]
+    return {
+        "pass": not still_eligible,
+        "return_column": return_column,
+        "threshold": UNEXPLAINED_MOVE_THRESHOLD,
+        "event_window_days": UNEXPLAINED_EVENT_WINDOW_DAYS,
+        "unexplained_breaks": len(rows),
+        "already_excluded": len(rows) - len(still_eligible),
+        "still_research_eligible": len(still_eligible),
+        "worst": [
+            {
+                "date": str(r[0]),
+                "symbol": r[1],
+                "isin": r[2],
+                "move": round(float(r[3]), 6),
+                "research_eligible": bool(r[4]),
+            }
+            for r in still_eligible[:20]
+        ],
+    }
+
+
 def check_eligibility_and_quarantine(
     con: duckdb.DuckDBPyConnection, root: Path, universe: str
 ) -> dict[str, Any]:
@@ -563,6 +651,7 @@ def run_quality_checks(root: Path | None = None) -> dict[str, Any]:
             "bar_sanity": check_bar_sanity(con, root, universe),
             "adjustment_sanity": check_adjustment_sanity(con, root, universe),
             "eligibility": check_eligibility_and_quarantine(con, root, universe),
+            "unexplained_breaks": check_unexplained_breaks(con, root, universe),
             "tradability": check_tradability(con, root, universe),
         }
     report["survivorship"] = check_survivorship(con, root)
@@ -589,7 +678,8 @@ def run_quality_checks(root: Path | None = None) -> dict[str, Any]:
 
     verdicts: dict[str, str] = {}
     for universe, checks in report["universes"].items():
-        for name in ("missing_sessions", "duplicates", "bar_sanity", "adjustment_sanity"):
+        for name in ("missing_sessions", "duplicates", "bar_sanity", "adjustment_sanity",
+                     "unexplained_breaks"):
             verdicts[f"{universe}.{name}"] = "PASS" if checks[name].get("pass") else "FAIL"
     verdicts["survivorship"] = "PASS" if report["survivorship"]["pass"] else "FAIL"
     verdicts["member_price_coverage"] = (
@@ -763,6 +853,46 @@ def render_report(report: dict[str, Any]) -> str:
         add("")
         add(tr["note"])
         add("")
+
+        # Absent in reports written before this check existed. An old report should
+        # still render rather than raise.
+        ub = checks.get("unexplained_breaks")
+        if ub is not None:
+            add("### Unexplained price breaks")
+            add("")
+            add(
+                f"A one-day move past {ub['threshold']:.0%} with no corporate action within "
+                f"{ub['event_window_days']} days either side of it. NSE's price bands top out "
+                "at 20%, so a move this size that nothing explains is a data fault rather than "
+                "a return."
+            )
+            add("")
+            add(
+                f"{ub['unexplained_breaks']:,} found · {ub['already_excluded']:,} already "
+                f"excluded from research · **{ub['still_research_eligible']:,} still "
+                "research-eligible**"
+            )
+            if ub["worst"]:
+                add("")
+                add(
+                    "These are still eligible, which means a strategy can act on them. "
+                    "Investigate before trusting any result that includes these securities."
+                )
+                add("")
+                add("| Date | Symbol | ISIN | Move |")
+                add("|---|---|---|---:|")
+                for r in ub["worst"]:
+                    add(f"| {r['date']} | {r['symbol']} | {r['isin']} | {r['move']:+.1%} |")
+            else:
+                add("")
+                add(
+                    "None are still eligible. Note that the check above, `adjustment sanity`, "
+                    "cannot see these: it starts from the corporate-action ledger and looks at "
+                    "each ex-date, so a break with no event behind it is never examined. That "
+                    "is how CUPID's +406.66% on 2026-01-01 passed while this report still said "
+                    "PASS."
+                )
+            add("")
 
         el = checks["eligibility"]
         add("### Research eligibility and quarantine")
