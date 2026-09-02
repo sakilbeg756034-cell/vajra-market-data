@@ -82,7 +82,11 @@ def _build_next_table(connection: duckdb.DuckDBPyConnection, clean_table: str) -
                 CAST(Volume AS DOUBLE) AS VolumeRaw,
                 CAST(TotalTrades AS DOUBLE) AS TotalTrades,
                 CAST(QuantityPerTrade AS DOUBLE) AS QuantityPerTrade,
-                CAST(DeliveryQuantity AS DOUBLE) AS DeliveryQuantity
+                CAST(DeliveryQuantity AS DOUBLE) AS DeliveryQuantity,
+                -- EOD2's feed is already split- and bonus-adjusted. The factor
+                -- below must not touch it; see the join condition in
+                -- adjusted_base.
+                FALSE AS IsLiveSource
             FROM {LEGACY_TABLE}
         ),
         live_base AS (
@@ -97,7 +101,10 @@ def _build_next_table(connection: duckdb.DuckDBPyConnection, clean_table: str) -
                 CAST(Volume AS DOUBLE) AS VolumeRaw,
                 NULL::DOUBLE AS TotalTrades,
                 NULL::DOUBLE AS QuantityPerTrade,
-                NULL::DOUBLE AS DeliveryQuantity
+                NULL::DOUBLE AS DeliveryQuantity,
+                -- NSE's bhavcopy is as-traded. This is the half that genuinely
+                -- needs the corporate-action factor applied.
+                TRUE AS IsLiveSource
             FROM {RAW_TABLE}
             WHERE Date >= DATE '{LIVE_START}'
         ),
@@ -140,6 +147,20 @@ def _build_next_table(connection: duckdb.DuckDBPyConnection, clean_table: str) -
             LEFT JOIN verified_adjustments a
               ON b.ISIN = a.ISIN
              AND b.Date < a.ExDate
+             -- Only the live half. The legacy half comes from a feed that has
+             -- already applied these ratios to its own history, so multiplying
+             -- again adjusts twice.
+             --
+             -- Invisible until 2026-01-01 because every row used to come from
+             -- that one feed: a uniform extra factor across a whole series
+             -- changes no return and leaves no break. The moment a second,
+             -- as-traded source began at LIVE_START, the two halves stopped
+             -- agreeing and the seam appeared on the first session of the year,
+             -- of size exactly 1/factor. Found on 2026-09-02 in fourteen
+             -- securities at once, each matching its own pending-2026 bonus:
+             -- ZFCVINDIA x5.94 (5:1), CUPID x5.07 (4:1), ECLERX x2.05 (1:1).
+             -- RELIANCE and INFY, which have no 2026 action, were untouched.
+             AND b.IsLiveSource
             GROUP BY ALL
         ),
         adjusted AS (
