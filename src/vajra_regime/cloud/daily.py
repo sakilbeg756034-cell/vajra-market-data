@@ -17,9 +17,11 @@ adjustment classifier -- teenon engine ke wahi tested function hain.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
+import urllib.request
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -38,6 +40,17 @@ MAX_CATCHUP_SESSIONS = 45
 # Corporate action calendar itne din peeche se refresh hota hai. NSE purane
 # event der se bhi jodta/badalta hai, isliye sirf "aaj" dekhna kaafi nahi.
 CA_LOOKBACK_DAYS = 120
+
+# NSE ki apni Total Market list. Isme har naam ka poora company naam aur
+# industry hai -- dono hamare bhavcopy me nahi aate. Sector isliye zaroori hai
+# ki 12 stock ek hi sector me hon to ye ek chhupa hua joker hai, aur bina
+# sector column ke wo dikhta hi nahi.
+#
+# Ye list NSE ke apne 750 se banti hai aur hamari VAJRA 750 turnover se, isliye
+# ~84% naam hi milte hain. Baaki khaali rehte hain -- galat naam bhar dene se
+# khaali chhod dena behtar hai.
+REFERENCE_URL = ("https://niftyindices.com/IndexConstituent/"
+                 "ind_niftytotalmarket_list.csv")
 
 MIN_ELIGIBLE_NAMES = 300
 MIN_UNIVERSE_ROWS = 500
@@ -159,6 +172,33 @@ def _attach_isin(paths: StatePaths, events: pd.DataFrame) -> pd.DataFrame:
     return out[out["ISIN"].notna()].copy()
 
 
+def refresh_reference(paths: StatePaths) -> int:
+    """Company naam aur industry NSE se laao. Fail ho to purani list chalti rahe."""
+    try:
+        request = urllib.request.Request(
+            REFERENCE_URL,
+            headers={"User-Agent": nse_live.USER_AGENT, "Accept": "text/csv,*/*"},
+        )
+        with urllib.request.urlopen(request, timeout=45) as response:
+            payload = response.read()
+        frame = pd.read_csv(io.BytesIO(payload), encoding="utf-8-sig")
+    except Exception as exc:                                    # noqa: BLE001
+        # Naam aur sector sundarta hain, faisla nahi. Inke liye poora run
+        # girana galat hoga -- purani list se kaam chal jaata hai.
+        print(f"reference list nahi mili ({exc}); purani chalti rahegi")
+        return 0
+
+    out = pd.DataFrame({
+        "ISIN": frame["ISIN Code"].astype(str).str.strip(),
+        "NAME": frame["Company Name"].astype(str).str.strip(),
+        "SECTOR": frame["Industry"].astype(str).str.strip(),
+    })
+    out = out[out["ISIN"].str.startswith("INE")].drop_duplicates("ISIN")
+    paths.reference.parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(paths.reference, index=False)
+    return int(len(out))
+
+
 def _seed_history(paths: StatePaths) -> pd.Series | None:
     if not paths.history_counts.exists():
         return None
@@ -195,6 +235,7 @@ def run(root: Path, today: date, scratch: Path) -> dict:
         added_days.append(day.isoformat())
 
     events = refresh_corporate_actions(paths, today)
+    reference = refresh_reference(paths)
 
     table = signal.rank_table(paths, _seed_history(paths))
     asof = table.attrs["asof"]
@@ -222,6 +263,7 @@ def run(root: Path, today: date, scratch: Path) -> dict:
         "sessions_added_this_run": added_days,
         "holidays_or_unpublished": holidays,
         "corporate_action_events_known": events,
+        "reference_names_known": reference,
     }
     (out / "status.json").write_text(
         json.dumps(status, indent=2), encoding="utf-8"

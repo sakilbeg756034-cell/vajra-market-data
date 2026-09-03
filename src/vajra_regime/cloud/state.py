@@ -65,6 +65,14 @@ class StatePaths:
     def history_counts(self) -> Path:
         return self.root / "state" / "history_counts.parquet"
 
+    @property
+    def reference(self) -> Path:
+        return self.root / "state" / "reference_names.parquet"
+
+    @property
+    def ath_seed(self) -> Path:
+        return self.root / "state" / "ath_seed.parquet"
+
 
 def read_meta(paths: StatePaths) -> dict:
     if not paths.meta.exists():

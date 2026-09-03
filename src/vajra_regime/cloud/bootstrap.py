@@ -102,6 +102,35 @@ def _event_calendar(published: Path) -> pd.DataFrame:
     }).sort_values(["ExDate", "ISIN"]).reset_index(drop=True)
 
 
+def _ath_seed(published: Path) -> pd.DataFrame:
+    """Har naam ka SABSE UNCHA close, poore 17 saal ke data se.
+
+    Cloud sirf ~500 session rakhta hai. Usse "all-time high" nikaalna jhooth
+    hoga -- wo do saal ka high hota. Isliye asli ATH yahan, poore dataset se
+    nikaal kar bheja jaata hai, aur cloud use aage badhata rehta hai.
+    Chhupi hui baat saaf likh deni chahiye: dataset 2009 se hai, isliye "all
+    time" ka matlab hai 2009 se, ya listing se -- jo baad me ho.
+
+    Bhaav bootstrap ki tareekh tak adjusted hain, isliye ATH bhi usi paimane par
+    hai. Uske baad ka koi bhi corporate action isspar bhi lagega -- wo kaam
+    signal.py karta hai, warna ATH purane paimane par atka rehta aur "top se
+    kitna neeche" hamesha galat dikhta.
+    """
+    glob = (published / "nifty750" / "parquet" / "nifty750_*.parquet").as_posix()
+    with duckdb.connect() as con:
+        return con.execute(
+            f"""
+            SELECT ISIN,
+                   max(Close)                          AS AthClose,
+                   arg_max(Date, Close)                AS AthDate,
+                   min(Date)                           AS FirstSeen
+            FROM read_parquet('{glob}')
+            WHERE Close IS NOT NULL AND Close > 0
+            GROUP BY ISIN
+            """
+        ).df()
+
+
 def _history_seed(published: Path, first_stored: pd.Timestamp) -> pd.DataFrame:
     """Store shuru hone se PEHLE har naam ne kitne session dekhe the.
 
@@ -132,10 +161,12 @@ def run(published: Path, out: Path, sessions: int) -> dict:
 
     events = _event_calendar(published)
     seed = _history_seed(published, first)
+    ath = _ath_seed(published)
 
     prices.to_parquet(paths.prices, index=False, compression="zstd")
     events.to_parquet(paths.events, index=False)
     seed.to_parquet(paths.history_counts, index=False)
+    ath.to_parquet(paths.ath_seed, index=False)
 
     meta = {
         "bootstrapped_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -146,6 +177,8 @@ def run(published: Path, out: Path, sessions: int) -> dict:
         "rows": int(len(prices)),
         "securities": int(prices["ISIN"].nunique()),
         "event_calendar_rows": int(len(events)),
+        "ath_seed_rows": int(len(ath)),
+        "ath_covers_from": str(pd.Timestamp(ath["FirstSeen"].min()).date()),
         "adjusted_through": str(pd.Timestamp(prices["Date"].max()).date()),
         "prices_are": "ADJUSTED through adjusted_through; live rows appended later are AS-TRADED",
     }
