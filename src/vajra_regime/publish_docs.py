@@ -357,10 +357,20 @@ assumes it fills at the last trade, model that yourself; `Close` here is the set
 figure.
 
 **The `Series` column is not decoration.** Rows marked `EQ` are the ordinary rolling segment.
-Rows marked **`BE` are the trade-to-trade segment**, where intraday trading is prohibited and
-every trade must be settled by delivery. A backtest that buys and sells a `BE` security within
-the same session is modelling something the exchange does not permit. Other series appear too.
-Filter on `Series` if your strategy trades intraday.
+Rows marked **`BE` are the trade-to-trade segment** and `BZ` the non-compliant segment, where
+intraday trading is prohibited and every trade must be settled by delivery. A backtest that buys
+and sells such a security within the same session is modelling something the exchange does not
+permit.
+
+These rows are here on purpose, and the reason is worth stating plainly. An earlier version of
+this dataset kept only `EQ`. A security placed under surveillance therefore disappeared from its
+own price history for the whole period — no error, no warning, simply absent rows. On the session
+it returned to `EQ`, the computed one-day return spanned the entire gap: one name showed +58.6%
+for what was really a 98-day move. Across seventeen years that produced 306 such breaks in 206
+liquid names.
+
+**Filter on `Series = 'EQ'` before selecting positions, but keep every row when computing
+returns.** Those are two different questions and they need two different filters.
 
 ## 9. What NOT to assume
 
@@ -484,9 +494,13 @@ COLUMN_NOTES: dict[str, tuple[str, str]] = {
     "ExchangeISIN": ("—", "ISIN as printed in the exchange bhavcopy, kept for cross-checking."),
     "Series": (
         "—",
-        "NSE series code. `EQ` is the ordinary rolling segment. **`BE` is trade-to-trade**: "
-        "intraday trading is prohibited and every trade settles by delivery, so a same-session "
-        "round trip is not possible. Filter on this if your strategy trades intraday.",
+        "NSE series code. `EQ` is the ordinary rolling segment. **`BE` is trade-to-trade** and "
+        "`BZ` is the non-compliant segment: intraday trading is prohibited there and every trade "
+        "settles by delivery. These rows are included so that a security which moves into "
+        "surveillance does not vanish from its own price history — without them the session it "
+        "returns on shows a multi-month move as a one-day return. They are excluded from the "
+        "tradeable universe on the days they carry a non-`EQ` code. Filter on `Series = 'EQ'` "
+        "before selecting positions.",
     ),
     "Open": ("INR", "Adjusted opening price."),
     "High": ("INR", "Adjusted session high."),

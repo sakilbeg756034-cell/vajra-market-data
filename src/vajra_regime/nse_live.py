@@ -32,6 +32,29 @@ USER_AGENT = (
 RAW_TABLE = "nse_live_raw_daily"
 INGEST_TABLE = "nse_live_ingest_manifest"
 
+# KYUN SIRF 'EQ' KAAFI NAHI HAI
+# -----------------------------
+# NSE jab kisi stock ko surveillance me daalta hai to uski series EQ se BE
+# (trade-for-trade) ya BZ (non-compliant) ho jaati hai. Stock roz trade hota
+# rehta hai -- bas segment badalta hai.
+#
+# Pehle yahan sirf 'EQ' liya jaata tha, isliye aisa stock us poore daur ke liye
+# data se GAYAB ho jaata tha. Koi error nahi -- bas rows nadarad. Jab wo wapas
+# EQ me aata, us din ka "1-din ka return" asal me poore gap ka nikalta:
+# SUZLON 2024-01-15 par +58.6% dikha, jabki wo 98 din ka move tha.
+# 17 saal me aise 306 hole, 206 alag naam.
+#
+# SME (SM/ST) aur government securities (GS/GB/SG) yahan jaan-boojh kar nahi
+# hain -- wo is strategy ka universe hai hi nahi.
+#
+# Ye sirf DATA ke liye hai. BE/BZ ka din tradeable NAHI mana jaata; wo rok
+# universe wali layer me lagti hai (monthly_universe.py), kyunki BE me har
+# sauda delivery me settle karna padta hai.
+TRADEABLE_SERIES: tuple[str, ...] = ("EQ", "BE", "BZ")
+
+# Ek hi din ek ISIN do series me mile to EQ jeetta hai, phir BE, phir BZ.
+SERIES_PRIORITY: dict[str, int] = {series: rank for rank, series in enumerate(TRADEABLE_SERIES)}
+
 
 @dataclass(frozen=True)
 class DownloadOutcome:
@@ -161,7 +184,7 @@ def normalize_udiff_bhavcopy(
     expected_ts = pd.Timestamp(expected_date)
     normalized = normalized.loc[
         normalized["Date"].eq(expected_ts)
-        & normalized["Series"].eq("EQ")
+        & normalized["Series"].isin(TRADEABLE_SERIES)
         & normalized["ISIN"].str.startswith("INE", na=False)
         & normalized["Symbol"].notna()
     ].copy()
@@ -185,15 +208,21 @@ def normalize_udiff_bhavcopy(
     normalized["SourceSha256"] = _sha256(zip_path)
     normalized["IngestedAtUTC"] = datetime.now(UTC)
 
-    normalized = normalized.sort_values(
-        ["Date", "ISIN", "Volume", "Symbol"],
-        ascending=[True, True, False, True],
-    ).drop_duplicates(["Date", "ISIN"], keep="first")
+    # Ek ISIN ek din me ek hi baar. Series ka darja sabse upar hai: ek hi
+    # security agar EQ aur BE dono me dikhe to EQ jeetega, kyunki tradeable
+    # wahi hai. Uske baad purana niyam waisa hi hai -- zyada volume, phir
+    # symbol -- taki chunav file ki tarteeb par kabhi na chhoote.
+    normalized = normalized.assign(
+        _series_rank=normalized["Series"].map(SERIES_PRIORITY)
+    ).sort_values(
+        ["Date", "ISIN", "_series_rank", "Volume", "Symbol"],
+        ascending=[True, True, True, False, True],
+    ).drop_duplicates(["Date", "ISIN"], keep="first").drop(columns="_series_rank")
     normalized = normalized.sort_values(["Date", "ISIN"]).reset_index(drop=True)
 
     if len(normalized) < minimum_kept_rows:
         raise ValueError(
-            f"Only {len(normalized)} valid EQ company rows remained for {expected_date}; "
+            f"Only {len(normalized)} valid company rows remained for {expected_date}; "
             f"minimum safety threshold is {minimum_kept_rows}."
         )
 

@@ -117,6 +117,12 @@ def _build_next_table(connection: duckdb.DuckDBPyConnection, clean_table: str) -
                 CAST(TotalTrades AS DOUBLE) AS TotalTrades,
                 CAST(QuantityPerTrade AS DOUBLE) AS QuantityPerTrade,
                 CAST(DeliveryQuantity AS DOUBLE) AS DeliveryQuantity,
+                -- Legacy snapshot me Series column hai hi nahi, kyunki wo
+                -- EQ-only banaya gaya tha. 'EQ' likhna yahan sach hai: jo rows
+                -- MAUJOOD hain wo sach me EQ hain. Jo BE rows chhoot gaye wo
+                -- gayab hain -- aur unka lautna is snapshot ko dobara banane
+                -- par hi hoga, jo alag faisla hai.
+                'EQ' AS Series,
                 -- EOD2's feed is already split- and bonus-adjusted. The factor
                 -- below must not touch it; see the join condition in
                 -- adjusted_base.
@@ -134,6 +140,7 @@ def _build_next_table(connection: duckdb.DuckDBPyConnection, clean_table: str) -
                 CAST(r.Close AS DOUBLE) AS CloseRaw,
                 CAST(r.Volume AS DOUBLE) AS VolumeRaw,
                 {delivery_columns},
+                r.Series,
                 -- NSE's bhavcopy is as-traded. This is the half that genuinely
                 -- needs the corporate-action factor applied.
                 TRUE AS IsLiveSource
@@ -174,6 +181,7 @@ def _build_next_table(connection: duckdb.DuckDBPyConnection, clean_table: str) -
                 b.TotalTrades,
                 b.QuantityPerTrade,
                 b.DeliveryQuantity,
+                b.Series,
                 COALESCE(EXP(SUM(LN(a.PriceFactor))), 1.0) AS CorporateActionPriceFactor,
                 COALESCE(EXP(SUM(LN(a.VolumeFactor))), 1.0) AS CorporateActionVolumeFactor
             FROM base b
@@ -209,6 +217,7 @@ def _build_next_table(connection: duckdb.DuckDBPyConnection, clean_table: str) -
                 TotalTrades,
                 QuantityPerTrade,
                 DeliveryQuantity,
+                Series,
                 CorporateActionPriceFactor,
                 CorporateActionVolumeFactor
             FROM adjusted_base
@@ -313,6 +322,7 @@ def _build_next_table(connection: duckdb.DuckDBPyConnection, clean_table: str) -
             EXTRACT(YEAR FROM r.Date)::INTEGER AS Year,
             r.Symbol,
             r.ISIN,
+            r.Series,
             r.Open,
             r.High,
             r.Low,

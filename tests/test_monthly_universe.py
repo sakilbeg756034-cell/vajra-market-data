@@ -124,6 +124,7 @@ def _build_fixture_database(config) -> None:
                 60::BIGINT AS TurnoverObservations60,
                 FALSE AS LargeReturnAnomalyFlag,
                 FALSE AS LongGapOver30DaysFlag,
+                'EQ' AS Series,
                 CASE
                     WHEN c.CandidateRank = 1 THEN FALSE
                     ELSE TRUE
@@ -202,3 +203,57 @@ def test_continuation_preserves_history_builds_only_completed_months(
     )
     assert universe_dir.exists()
     assert backup_dir.exists()
+
+
+def test_a_name_in_the_surveillance_segment_cannot_enter_the_universe(tmp_path):
+    """BE ke din stock ka DATA rakhte hain, par usse KHAREEDTE nahi.
+
+    Ye do alag baatein hain aur pehle dono ek saath toot gayi thin. Intake sirf
+    EQ leta tha, isliye surveillance ke daur me stock data se hi gayab ho jaata
+    tha -- aur wapas aane par uska "1-din ka return" poore gap ka nikalta tha
+    (SUZLON par +58.6%, jo asal me 98 din ka move tha).
+
+    Ab data aata hai. Par BE me har sauda delivery me settle karna padta hai aur
+    intraday mana hai -- us din us naam ko portfolio me lena asli duniya me hota
+    hi nahi. Isliye rok yahan hai, LiquidityRank se PEHLE, taaki wo naam top-750
+    ki ek jagah bhi na ghere. Uski jagah agla eligible naam aana chahiye.
+    """
+    config = _config(tmp_path)
+    _build_fixture_database(config)
+
+    database = str(config.environment.duckdb_path)
+    with duckdb.connect(database) as connection:
+        connection.execute(
+            """
+            UPDATE clean_daily SET Series = 'BE'
+            WHERE Symbol = 'L0002' AND Date = DATE '2026-07-31'
+            """
+        )
+
+    summary = continue_monthly_750_universe(config)
+    assert summary["status"] == "SUCCESS"
+
+    with duckdb.connect(database, read_only=True) as connection:
+        present = connection.execute(
+            """
+            SELECT COUNT(*) FROM monthly_vajra_750_universe
+            WHERE RebalanceDate = DATE '2026-07-31' AND Symbol = 'L0002'
+            """
+        ).fetchone()[0]
+        # usi naam ka pichhla mahina, jab wo EQ me tha
+        previous = connection.execute(
+            """
+            SELECT COUNT(*) FROM monthly_vajra_750_universe
+            WHERE RebalanceDate = DATE '2026-06-30' AND Symbol = 'L0002'
+            """
+        ).fetchone()[0]
+        members = connection.execute(
+            """
+            SELECT COUNT(*) FROM monthly_vajra_750_universe
+            WHERE RebalanceDate = DATE '2026-07-31'
+            """
+        ).fetchone()[0]
+
+    assert int(present) == 0, "BE ke din wo naam universe me nahi hona chahiye"
+    assert int(previous) == 1, "EQ wale mahine me wahi naam maujood tha"
+    assert int(members) == 750, "uski jagah agla eligible naam aana chahiye"
