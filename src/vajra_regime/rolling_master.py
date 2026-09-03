@@ -12,6 +12,7 @@ import pandas as pd
 from vajra_regime.config import AppConfig
 from vajra_regime.corporate_actions import RECONCILIATION_TABLE
 from vajra_regime.data_layout import DataLayout
+from vajra_regime.nse_delivery import DELIVERY_TABLE
 from vajra_regime.master_safety import ensure_mutable_master
 from vajra_regime.nse_live import RAW_TABLE
 
@@ -66,6 +67,39 @@ def _build_next_table(connection: duckdb.DuckDBPyConnection, clean_table: str) -
             "Run the corporate-action audit first."
         )
 
+    # Delivery aur trade-count UDiFF bhavcopy me hote hi nahi -- wo alag file
+    # (`sec_bhavdata_full`) se aate hain, jo `nse_delivery.py` laata hai. Wo
+    # table abhi bhara na ho to purane bartaav par rehte hain (NULL); bhara ho
+    # to live rows me bhi delivery aa jaati hai, jaisa 2009-2025 me pehle se hai.
+    #
+    # Join (Date, Symbol) par hai kyunki us file me ISIN hai hi nahi. Ye is
+    # project ke "Symbol par kabhi join mat karo" niyam ka jaan-boojh kar liya
+    # gaya apwaad hai: poore 17 saal me ek bhi (Date, Symbol) aisa nahi mila
+    # jispar do ISIN hon (0 case). Symbol saalon me badalte hain, ek din ke
+    # andar nahi.
+    #
+    # QuantityPerTrade wahi formula se banta hai jo legacy feed me hai --
+    # Volume / TotalTrades, 2 dashamlav. Alag tarike se ginne par seam par ek
+    # chup-chaap fark aa jaata, jo dikhta nahi aur galat hota.
+    if _table_exists(connection, DELIVERY_TABLE):
+        delivery_columns = (
+            "CAST(d.TotalTrades AS DOUBLE) AS TotalTrades,"
+            " ROUND(CAST(r.Volume AS DOUBLE)"
+            " / NULLIF(CAST(d.TotalTrades AS DOUBLE), 0), 2) AS QuantityPerTrade,"
+            " CAST(d.DeliveryQuantity AS DOUBLE) AS DeliveryQuantity"
+        )
+        delivery_join = (
+            f"LEFT JOIN {DELIVERY_TABLE} d"
+            " ON d.Date = r.Date AND d.Symbol = r.Symbol"
+        )
+    else:
+        delivery_columns = (
+            "NULL::DOUBLE AS TotalTrades,"
+            " NULL::DOUBLE AS QuantityPerTrade,"
+            " NULL::DOUBLE AS DeliveryQuantity"
+        )
+        delivery_join = ""
+
     connection.execute(f"DROP TABLE IF EXISTS {NEXT_TABLE}")
     connection.execute(
         f"""
@@ -91,22 +125,21 @@ def _build_next_table(connection: duckdb.DuckDBPyConnection, clean_table: str) -
         ),
         live_base AS (
             SELECT
-                Date,
-                Symbol,
-                UPPER(ISIN) AS ISIN,
-                CAST(Open AS DOUBLE) AS OpenRaw,
-                CAST(High AS DOUBLE) AS HighRaw,
-                CAST(Low AS DOUBLE) AS LowRaw,
-                CAST(Close AS DOUBLE) AS CloseRaw,
-                CAST(Volume AS DOUBLE) AS VolumeRaw,
-                NULL::DOUBLE AS TotalTrades,
-                NULL::DOUBLE AS QuantityPerTrade,
-                NULL::DOUBLE AS DeliveryQuantity,
+                r.Date,
+                r.Symbol,
+                UPPER(r.ISIN) AS ISIN,
+                CAST(r.Open AS DOUBLE) AS OpenRaw,
+                CAST(r.High AS DOUBLE) AS HighRaw,
+                CAST(r.Low AS DOUBLE) AS LowRaw,
+                CAST(r.Close AS DOUBLE) AS CloseRaw,
+                CAST(r.Volume AS DOUBLE) AS VolumeRaw,
+                {delivery_columns},
                 -- NSE's bhavcopy is as-traded. This is the half that genuinely
                 -- needs the corporate-action factor applied.
                 TRUE AS IsLiveSource
-            FROM {RAW_TABLE}
-            WHERE Date >= DATE '{LIVE_START}'
+            FROM {RAW_TABLE} r
+            {delivery_join}
+            WHERE r.Date >= DATE '{LIVE_START}'
         ),
         base AS (
             SELECT * FROM historical_base
