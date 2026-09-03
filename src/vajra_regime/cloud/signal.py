@@ -48,10 +48,17 @@ MAX_FROZEN_RATE = 0.20
 N_HOLDINGS = 12
 EXIT_RANK = 36
 
+# 3 mahine ka return aur all-time high. Ye faisle me nahi aate -- SCORE me inka
+# koi hissa nahi -- par scanner me inke bina naam pehchana nahi jaata: "kitna
+# upar chala gaya" aur "top se kitna neeche hai" wahi do sawal hain jo har koi
+# pehle poochta hai.
+SHORT_LOOKBACK = 63
+
 OUTPUT_COLUMNS = [
-    "RANK", "SYMBOL", "ISIN", "CLOSE", "SCORE", "R12_PCT", "R6_PCT",
-    "VOLATILITY_PCT", "VAM", "AGREE", "ADTV_CR", "STALE_SESSIONS",
-    "FROZEN_RATE", "ELIGIBLE",
+    "RANK", "SYMBOL", "NAME", "SECTOR", "ISIN", "CLOSE", "SCORE",
+    "R12_PCT", "R6_PCT", "R3_PCT", "VOLATILITY_PCT", "VAM", "AGREE",
+    "ATH", "ATH_DATE", "FROM_ATH_PCT",
+    "ADTV_CR", "STALE_SESSIONS", "FROZEN_RATE", "ELIGIBLE",
 ]
 
 
@@ -292,6 +299,59 @@ def quarantine(paths: StatePaths, frame: pd.DataFrame, close: pd.DataFrame,
     return flagged.rolling(LOOKBACK_BLACKOUT, min_periods=1).max().astype(bool)
 
 
+def _reference(paths: StatePaths, universe) -> tuple[pd.Series, pd.Series]:
+    """ISIN se company naam aur sector. Na mile to khaali -- andaaza nahi."""
+    empty = pd.Series("", index=universe)
+    if not paths.reference.exists():
+        return empty, empty.copy()
+    ref = pd.read_parquet(paths.reference).drop_duplicates("ISIN").set_index("ISIN")
+    return (ref["NAME"].reindex(universe).fillna(""),
+            ref["SECTOR"].reindex(universe).fillna(""))
+
+
+def _all_time_high(paths: StatePaths, frame: pd.DataFrame,
+                   close: pd.DataFrame, universe):
+    """Asli all-time high -- store ke 500 session se nahi.
+
+    Do hisse jodte hain:
+      1. Bootstrap se pehle ka ATH, jo laptop par poore 17-saal ke data se nikla
+      2. Store ke andar ka high
+
+    Pehle hisse par bootstrap ke BAAD wala corporate action factor lagana padta
+    hai. Bina uske ek 1:1 bonus ke baad ATH dogna dikhta rahega aur "top se
+    kitna neeche" hamesha jhootha bada dikhega -- theek wahi galti jo is project
+    me do baar ho chuki hai, bas doosre roop me.
+    """
+    store_high = close.max().reindex(universe)
+    store_when = close.idxmax().reindex(universe)
+
+    if not paths.ath_seed.exists():
+        return store_high, store_when.dt.strftime("%Y-%m-%d").fillna("")
+
+    boundary = pd.to_datetime(frame["AdjustedThrough"]).max()
+    with duckdb.connect() as con:
+        factors = con.execute(
+            f"""
+            SELECT ISIN, coalesce(exp(sum(ln(PriceFactor))), 1.0) AS Factor
+            FROM read_parquet('{paths.events.as_posix()}')
+            WHERE PriceFactor IS NOT NULL AND PriceFactor <> 1.0
+              AND ExDate IS NOT NULL
+              AND CAST(ExDate AS DATE) > DATE '{boundary.date().isoformat()}'
+            GROUP BY ISIN
+            """
+        ).df().set_index("ISIN")["Factor"] if pd.notna(boundary) else pd.Series(dtype=float)
+
+    seed = pd.read_parquet(paths.ath_seed).drop_duplicates("ISIN").set_index("ISIN")
+    scale = factors.reindex(universe).fillna(1.0)
+    seed_high = seed["AthClose"].reindex(universe) * scale
+    seed_when = pd.to_datetime(seed["AthDate"].reindex(universe))
+
+    use_seed = seed_high.fillna(-1.0) >= store_high.fillna(-1.0)
+    ath = seed_high.where(use_seed, store_high)
+    when = seed_when.where(use_seed, store_when)
+    return ath, when.dt.strftime("%Y-%m-%d").fillna("")
+
+
 def rank_table(paths: StatePaths,
                seed_history: pd.Series | None = None) -> pd.DataFrame:
     frame = universe_metrics(paths)
@@ -302,6 +362,7 @@ def rank_table(paths: StatePaths,
     sc = core.score(m["Close"])
     r12 = core.total_return(m["Close"], core.LONG_LOOKBACK)
     r6 = core.total_return(m["Close"], core.SHORT_LOOKBACK)
+    r3 = core.total_return(m["Close"], SHORT_LOOKBACK)
     vol = core.realised_vol(m["Close"])
     liquidity = core.adtv(m["TurnoverINR"])
     frozen = core.frozen_rate(m["IsFrozenBar"], m["Traded"])
@@ -314,13 +375,23 @@ def rank_table(paths: StatePaths,
     live = member.loc[asof] & m["Traded"].loc[asof] & ~barred.loc[asof]
     universe = live[live].index
 
+    names, sectors = _reference(paths, universe)
+    px = m["Close"].loc[asof].reindex(universe)
+    ath, ath_date = _all_time_high(paths, frame, m["Close"], universe)
+
     df = pd.DataFrame({
         "SYMBOL": symbols.reindex(universe),
+        "NAME": names,
+        "SECTOR": sectors,
         "ISIN": universe,
         "CLOSE": m["Close"].loc[asof].reindex(universe).round(2),
         "SCORE": sc.loc[asof].reindex(universe).round(4),
         "R12_PCT": (r12.loc[asof].reindex(universe) * 100).round(4),
         "R6_PCT": (r6.loc[asof].reindex(universe) * 100).round(4),
+        "R3_PCT": (r3.loc[asof].reindex(universe) * 100).round(4),
+        "ATH": ath.round(2),
+        "ATH_DATE": ath_date,
+        "FROM_ATH_PCT": ((px / ath.replace(0.0, np.nan) - 1.0) * 100).round(2),
         "VOLATILITY_PCT": (vol.loc[asof].reindex(universe) * 100).round(4),
         "ADTV_CR": (liquidity.loc[asof].reindex(universe) / 1e7).round(2),
         "STALE_SESSIONS": stale.loc[asof].reindex(universe),
