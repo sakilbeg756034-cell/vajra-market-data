@@ -11,6 +11,7 @@ from vajra_regime.config import AppConfig
 from vajra_regime.corporate_actions import run_corporate_action_audit
 from vajra_regime.master_safety import guard_protected_tree
 from vajra_regime.monthly_universe import continue_monthly_750_universe
+from vajra_regime.nse_delivery import catch_up_delivery
 from vajra_regime.nse_live import catch_up_nse_eod, summarize_live_eod
 from vajra_regime.rolling_master import rebuild_rolling_clean_data
 
@@ -202,12 +203,29 @@ def _run_daily_pipeline(
             "generated_at_utc": datetime.now(UTC).isoformat(),
             "target_date": target.isoformat(),
             "intake": intake,
+            # Delivery yahan jaan-boojh kar nahi hai: ye status intake FAIL hone
+            # par likha jaata hai, aur delivery ka kaam uske BAAD hota hai.
             "published_data_changed_during_build": None,
         }
         status["status_path"] = str(_write_status(config, status))
         raise RuntimeError(
             "NSE EOD intake reported one or more real errors. Read latest_daily_pipeline_status.json."
         )
+
+    # Delivery data alag file se aata hai (`sec_bhavdata_full`), kyunki UDiFF
+    # bhavcopy me wo hota hi nahi. Isi ek line ke na hone se 2026 me delivery
+    # column poora khaali reh gaya tha jabki 2020-2025 me 99-100% bhara tha --
+    # koi error nahi, koi warning nahi, bas column gayab.
+    #
+    # Ye fail hone par poora pipeline nahi girta: delivery ek sahayak column hai,
+    # signal uspar nirbhar nahi karta. Par chuppi bhi nahi -- status me darj
+    # hota hai taaki dobara mahinon tak kisi ka dhyaan na jaye, aisa na ho.
+    try:
+        delivery = catch_up_delivery(
+            config, start_date=intake_start, end_date=target
+        )
+    except Exception as exc:                                    # noqa: BLE001
+        delivery = {"error": str(exc)}
 
     after_raw = summarize_live_eod(config)
     current_raw_last = _as_date(after_raw.get("raw_last_date"))
@@ -242,6 +260,7 @@ def _run_daily_pipeline(
             "target_date": target.isoformat(),
             "intake_start": intake_start.isoformat(),
             "intake": intake,
+            "delivery": delivery,
             "raw_before": before_raw,
             "clean_before": before_clean,
             "raw_after": final_raw,
@@ -263,6 +282,7 @@ def _run_daily_pipeline(
             "target_date": target.isoformat(),
             "intake_start": intake_start.isoformat(),
             "intake": intake,
+            "delivery": delivery,
             "raw_after": final_raw,
             "clean_after": final_clean,
             "alignment": alignment,
@@ -286,6 +306,7 @@ def _run_daily_pipeline(
         "raw_changed": raw_changed,
         "master_needed_sync": master_needs_sync,
         "intake": intake,
+            "delivery": delivery,
         "raw_before": before_raw,
         "clean_before": before_clean,
         "raw_after": final_raw,
