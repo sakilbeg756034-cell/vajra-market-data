@@ -41,14 +41,28 @@ MAX_CATCHUP_SESSIONS = 45
 # event der se bhi jodta/badalta hai, isliye sirf "aaj" dekhna kaafi nahi.
 CA_LOOKBACK_DAYS = 120
 
-# NSE ki apni Total Market list. Isme har naam ka poora company naam aur
-# industry hai -- dono hamare bhavcopy me nahi aate. Sector isliye zaroori hai
-# ki 12 stock ek hi sector me hon to ye ek chhupa hua joker hai, aur bina
-# sector column ke wo dikhta hi nahi.
+# NAAM AUR SECTOR -- DO ALAG SOURCE, KYUNKI EK SE DONO NAHI MILTE
+# ----------------------------------------------------------------
+# Bhavcopy me na company ka poora naam hota hai na industry. Sector isliye
+# zaroori hai ki 12 stock ek hi sector me hon to wo ek chhupa hua joker hai,
+# aur bina sector column ke wo dikhta hi nahi.
 #
-# Ye list NSE ke apne 750 se banti hai aur hamari VAJRA 750 turnover se, isliye
-# ~84% naam hi milte hain. Baaki khaali rehte hain -- galat naam bhar dene se
-# khaali chhod dena behtar hai.
+# Pehle dono niftyindices ki Total Market list se aate the. Wo list NSE ke
+# apne 750 se banti hai, jabki hamari VAJRA 750 turnover se -- isliye 731 me
+# se 117 naam usme the hi NAHI, aur top-12 me se paanch cell khaali dikhte the
+# (SBC, BLISSGVS, RPEL, RPTECH, HAPPYFORGE).
+#
+# NAAM ke liye ab NSE ki poori listed-equity list use hoti hai: usme 2,568
+# naam hain aur hamare 731 me se 731 mil jaate hain. Nifty500, Microcap250,
+# Smallcap250 -- teenon jaanche gaye, teenon Total Market ke ANDAR hi hain,
+# isliye unse sector ka daayra nahi badhta.
+#
+# SECTOR sirf niftyindices se aata hai, aur wahi ~84% par rukta hai. NSE ka
+# per-symbol metadata API usse bhar sakta tha par wo automated request ko
+# block karta hai (403). Isliye baaki sector khaali rehte hain -- galat sector
+# bhar dena khaali chhodne se bura hai, kyunki sector concentration ISI column
+# se dekha jaata hai.
+NAME_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 REFERENCE_URL = ("https://niftyindices.com/IndexConstituent/"
                  "ind_niftytotalmarket_list.csv")
 
@@ -175,31 +189,73 @@ def _attach_isin(paths: StatePaths, events: pd.DataFrame) -> pd.DataFrame:
     return out[out["ISIN"].notna()].copy()
 
 
+def _csv_from(url: str) -> pd.DataFrame:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": nse_live.USER_AGENT,
+            "Accept": "text/csv,*/*",
+            "Referer": "https://www.nseindia.com/",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=45) as response:
+        payload = response.read()
+    frame = pd.read_csv(io.BytesIO(payload), encoding="utf-8-sig")
+    frame.columns = [str(c).strip() for c in frame.columns]
+    return frame
+
+
 def refresh_reference(paths: StatePaths) -> int:
-    """Company naam aur industry NSE se laao. Fail ho to purani list chalti rahe."""
+    """Company naam aur industry laao. Fail ho to purani list chalti rahe.
+
+    Naam aur sector alag-alag source se aate hain aur alag-alag door tak
+    pahunchte hain. Dono ek saath fail nahi hote, isliye dono ki apni koshish
+    hoti hai: sector na mile to naam phir bhi bhar jaate hain.
+    """
+    names = pd.DataFrame(columns=["ISIN", "NAME"])
     try:
-        request = urllib.request.Request(
-            REFERENCE_URL,
-            headers={"User-Agent": nse_live.USER_AGENT, "Accept": "text/csv,*/*"},
-        )
-        with urllib.request.urlopen(request, timeout=45) as response:
-            payload = response.read()
-        frame = pd.read_csv(io.BytesIO(payload), encoding="utf-8-sig")
+        raw = _csv_from(NAME_URL)
+        names = pd.DataFrame({
+            "ISIN": raw["ISIN NUMBER"].astype(str).str.strip(),
+            "NAME": raw["NAME OF COMPANY"].astype(str).str.strip(),
+        })
     except Exception as exc:                                    # noqa: BLE001
+        print(f"NSE equity list nahi mili ({exc}); naam ke liye index list par bharosa")
+
+    sectors = pd.DataFrame(columns=["ISIN", "NAME", "SECTOR"])
+    try:
+        raw = _csv_from(REFERENCE_URL)
+        sectors = pd.DataFrame({
+            "ISIN": raw["ISIN Code"].astype(str).str.strip(),
+            "NAME": raw["Company Name"].astype(str).str.strip(),
+            "SECTOR": raw["Industry"].astype(str).str.strip(),
+        })
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"index constituent list nahi mili ({exc}); sector khaali rahenge")
+
+    if names.empty and sectors.empty:
         # Naam aur sector sundarta hain, faisla nahi. Inke liye poora run
         # girana galat hoga -- purani list se kaam chal jaata hai.
-        print(f"reference list nahi mili ({exc}); purani chalti rahegi")
+        print("koi reference list nahi mili; purani chalti rahegi")
         return 0
 
-    out = pd.DataFrame({
-        "ISIN": frame["ISIN Code"].astype(str).str.strip(),
-        "NAME": frame["Company Name"].astype(str).str.strip(),
-        "SECTOR": frame["Industry"].astype(str).str.strip(),
-    })
-    out = out[out["ISIN"].str.startswith("INE")].drop_duplicates("ISIN")
+    # Poori equity list ke naam pehle rakhe jaate hain, kyunki wo har listed
+    # naam tak pahunchti hai. Index list uske baad aati hai aur sirf wahan
+    # bharti hai jahan pehli ne kuch diya hi nahi -- aur sector to sirf wahin
+    # se aata hai.
+    stacked = pd.concat(
+        [names.assign(SECTOR=pd.NA), sectors], ignore_index=True
+    )
+    stacked["ISIN"] = stacked["ISIN"].astype(str).str.strip()
+    stacked = stacked[stacked["ISIN"].str.startswith("INE")]
+    merged = (
+        stacked.groupby("ISIN", as_index=False)
+        .agg({"NAME": "first", "SECTOR": "first"})
+    )
+
     paths.reference.parent.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(paths.reference, index=False)
-    return int(len(out))
+    merged.to_parquet(paths.reference, index=False)
+    return int(len(merged))
 
 
 def _seed_history(paths: StatePaths) -> pd.Series | None:
