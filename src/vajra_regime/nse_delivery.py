@@ -137,6 +137,32 @@ def fetch_delivery(trading_date: date) -> pd.DataFrame | None:
     # Price master ke saath ek hi series-set. Warna BE/BZ rows to aati hain par
     # unki delivery khaali reh jaati -- aur wahi chuppi wapas aa jaati jise
     # rokne ke liye ye file likhi gayi thi.
+    #
+    # BE/BZ PAR DELIVERY KHAALI RAHEGI, AUR YE THEEK HAI.
+    # ---------------------------------------------------
+    # NSE in rows me DELIV_QTY par '-' likhta hai -- har BE row par, hamesha
+    # (19 May 2026 ko us din ki saari 189 BE rows par jaancha). Wajah samajh
+    # aati hai: T2T me intraday netting hoti hi nahi, har sauda delivery me
+    # settle hota hai, isliye alag figure report karne ka matlab nahi.
+    #
+    # To kya use Volume se bhar dein? Purana source yahi karta tha aur uska
+    # saboot bhi bilkul saaf hai: 1,04,271 BE/BZ rows me ek bhi aisi nahi mili
+    # jahan DLV_QTY Volume se ALAG ho -- ya barabar (70,178) ya khaali
+    # (34,093). EQ rows me ye barabari sirf 0.32% par hoti hai, yaani ittefaq
+    # nahi hai.
+    #
+    # Phir bhi hum nahi bharte, do wajah se:
+    #
+    #   1. Wo number NSE ne diya hi nahi. Report kiye hue aur khud nikale hue
+    #      ko ek column me milaana wahi dhundhlapan hai jise ye project har
+    #      jagah hatata aaya hai.
+    #   2. Delivery% is liye dekha jaata hai ki asli kharidari kitni thi aur
+    #      intraday shor kitna. BE par 100% likhna har surveillance naam ko
+    #      sabse "bullish" dikha deta -- jabki wo majboori hai, sanket nahi.
+    #      Ek jhoothi khaali jagah se ek jhootha signal zyada mehnga padta hai.
+    #
+    # Isliye delivery coverage EQ rows par naapi jaani chahiye. Wahan wo 100%
+    # hai. BE/BZ par khaali hona kami nahi, sach hai.
     frame["SERIES"] = frame["SERIES"].astype(str).str.strip().str.upper()
     frame = frame.loc[frame["SERIES"].isin(TRADEABLE_SERIES)].copy()
 

@@ -515,6 +515,10 @@ def check_parquet_csv_parity(root: Path, manifest: dict[str, Any]) -> dict[str, 
 
 UNEXPLAINED_MOVE_THRESHOLD = 0.50
 UNEXPLAINED_EVENT_WINDOW_DAYS = 5
+# Itne se zyada calendar din ka faasla ho to wo "ek din ka move" hai hi nahi.
+# Lambi chhutti (Diwali, Holi, weekend ke saath) 5-6 din tak kha jaati hai;
+# 15 uske upar ka wo daayra hai jahan row sach me gayab thi.
+UNEXPLAINED_GAP_DAYS = 15
 
 
 def check_unexplained_breaks(
@@ -557,10 +561,24 @@ def check_unexplained_breaks(
             "note": "No adjusted daily-return column found; check not run.",
             "columns_seen": sorted(available)[:40],
         }
+    # Ek break do bilkul alag wajah se ban sakta hai, aur unke ilaaj alag hain.
+    #
+    # Agar pichhli row kal ki thi, to move sach me ek din me hua -- ya to asli
+    # crash, ya adjustment chhoot gaya.
+    #
+    # Par agar pichhli row mahino purani hai, to ye "1-din ka move" hai hi nahi:
+    # wo poore gap ka return hai, jise ek din ka bata diya gaya. SUZLON ka
+    # +58.6% aisa hi tha -- 98 din ka move, kyunki wo BE series me chala gaya
+    # tha aur intake sirf EQ leta tha.
+    #
+    # Dono ko ek ginti me milaana report ko jhutha nahi karta, par bekaar zaroor
+    # kar deta hai: padhne wale ko pata hi nahi chalta ki dekhna kahan hai.
+    gap_column = "GapDays" if "GapDays" in available else "NULL"
     rows = con.execute(
         f"""
         WITH p AS (
-            SELECT Date, Symbol, ISIN, "{return_column}" AS Return1D, IsResearchEligible
+            SELECT Date, Symbol, ISIN, "{return_column}" AS Return1D, IsResearchEligible,
+                   {gap_column} AS GapDays
             FROM read_parquet('{g}')
             WHERE "{return_column}" IS NOT NULL
               AND abs("{return_column}") > {UNEXPLAINED_MOVE_THRESHOLD}
@@ -569,7 +587,7 @@ def check_unexplained_breaks(
             SELECT ISIN, Symbol, CAST(ExDate AS DATE) AS ExDate
             FROM read_parquet('{ca}') WHERE ExDate IS NOT NULL
         )
-        SELECT p.Date, p.Symbol, p.ISIN, p.Return1D, p.IsResearchEligible
+        SELECT p.Date, p.Symbol, p.ISIN, p.Return1D, p.IsResearchEligible, p.GapDays
         FROM p
         WHERE NOT EXISTS (
             SELECT 1 FROM e
@@ -580,24 +598,38 @@ def check_unexplained_breaks(
         """
     ).fetchall()
     still_eligible = [r for r in rows if r[4]]
+
+    def _spans_a_gap(row: tuple) -> bool:
+        return row[5] is not None and float(row[5]) > UNEXPLAINED_GAP_DAYS
+
+    across_gap = [r for r in still_eligible if _spans_a_gap(r)]
+    single_session = [r for r in still_eligible if not _spans_a_gap(r)]
+
+    def _detail(row: tuple) -> dict[str, Any]:
+        return {
+            "date": str(row[0]),
+            "symbol": row[1],
+            "isin": row[2],
+            "move": round(float(row[3]), 6),
+            "research_eligible": bool(row[4]),
+            "gap_days": None if row[5] is None else int(row[5]),
+        }
+
     return {
         "pass": not still_eligible,
         "return_column": return_column,
         "threshold": UNEXPLAINED_MOVE_THRESHOLD,
         "event_window_days": UNEXPLAINED_EVENT_WINDOW_DAYS,
+        "gap_days_threshold": UNEXPLAINED_GAP_DAYS,
         "unexplained_breaks": len(rows),
         "already_excluded": len(rows) - len(still_eligible),
         "still_research_eligible": len(still_eligible),
-        "worst": [
-            {
-                "date": str(r[0]),
-                "symbol": r[1],
-                "isin": r[2],
-                "move": round(float(r[3]), 6),
-                "research_eligible": bool(r[4]),
-            }
-            for r in still_eligible[:20]
-        ],
+        # Ye do ginti alag hain kyunki inke ilaaj alag hain: ek me adjustment
+        # dekhna hota hai, doosre me ye ki row gayab kyun thi.
+        "eligible_within_one_session": len(single_session),
+        "eligible_across_a_gap": len(across_gap),
+        "worst_within_one_session": [_detail(r) for r in single_session[:15]],
+        "worst_across_a_gap": [_detail(r) for r in across_gap[:15]],
     }
 
 
@@ -872,17 +904,44 @@ def render_report(report: dict[str, Any]) -> str:
                 f"excluded from research · **{ub['still_research_eligible']:,} still "
                 "research-eligible**"
             )
-            if ub["worst"]:
+            if ub["still_research_eligible"]:
                 add("")
                 add(
                     "These are still eligible, which means a strategy can act on them. "
-                    "Investigate before trusting any result that includes these securities."
+                    "They split into two kinds, and the two have different causes."
                 )
                 add("")
-                add("| Date | Symbol | ISIN | Move |")
-                add("|---|---|---|---:|")
-                for r in ub["worst"]:
-                    add(f"| {r['date']} | {r['symbol']} | {r['isin']} | {r['move']:+.1%} |")
+                add(
+                    f"**{ub['eligible_within_one_session']:,} happened inside a single "
+                    f"session.** The previous row is the previous trading day, so the move is "
+                    "real: either a genuine crash or an adjustment that was never applied."
+                )
+                if ub["worst_within_one_session"]:
+                    add("")
+                    add("| Date | Symbol | ISIN | Move |")
+                    add("|---|---|---|---:|")
+                    for r in ub["worst_within_one_session"]:
+                        add(
+                            f"| {r['date']} | {r['symbol']} | {r['isin']} "
+                            f"| {r['move']:+.1%} |"
+                        )
+                add("")
+                add(
+                    f"**{ub['eligible_across_a_gap']:,} span a gap of more than "
+                    f"{ub['gap_days_threshold']} days.** These are not one-day moves at all. "
+                    "The security has no rows for the intervening period, so the whole gap's "
+                    "return is being reported as a single session. The question here is not "
+                    "what moved the price - it is why the rows are missing."
+                )
+                if ub["worst_across_a_gap"]:
+                    add("")
+                    add("| Date | Symbol | ISIN | Move | Gap (days) |")
+                    add("|---|---|---|---:|---:|")
+                    for r in ub["worst_across_a_gap"]:
+                        add(
+                            f"| {r['date']} | {r['symbol']} | {r['isin']} "
+                            f"| {r['move']:+.1%} | {r['gap_days']} |"
+                        )
             else:
                 add("")
                 add(
