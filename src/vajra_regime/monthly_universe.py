@@ -263,6 +263,7 @@ def _build_live_candidates(
             "LargeReturnAnomalyFlag",
             "LongGapOver30DaysFlag",
             "IsResearchEligible",
+            "Series",
         },
     )
     connection.execute(f"DROP TABLE IF EXISTS {LIVE_CANDIDATE_TABLE}")
@@ -301,6 +302,7 @@ def _build_live_candidates(
                 DATE_DIFF('day', CAST(l.Date AS DATE), m.RebalanceDate) AS StaleCalendarDays,
                 l.Symbol,
                 l.ISIN,
+                l.Series,
                 l.Close,
                 l.Volume,
                 l.Turnover,
@@ -317,6 +319,17 @@ def _build_live_candidates(
                      AND l.TurnoverObservations60 >= {MIN_TURNOVER_OBSERVATIONS}
                      AND l.MedianTurnover60 > 0
                      AND l.IsResearchEligible
+                     -- Rebalance ke din stock EQ me hona chahiye.
+                     --
+                     -- BE/BZ surveillance segment hai: wahan har sauda delivery
+                     -- me settle karna padta hai, intraday mana hai, aur aksar
+                     -- 100% margin lagta hai. Us daur ka DATA hum rakhte hain
+                     -- (warna price series me hole ban jaata hai aur R12 jhutha
+                     -- ho jaata hai), par us din KHAREEDNA alag baat hai.
+                     --
+                     -- Ye rok yahan hai, LiquidityRank se PEHLE -- isliye aisa
+                     -- naam top-750 ki ek jagah bhi nahi ghera.
+                     AND l.Series = 'EQ'
                     THEN TRUE ELSE FALSE
                 END AS EligibleForUniverse
             FROM latest l

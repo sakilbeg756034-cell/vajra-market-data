@@ -34,7 +34,7 @@ import duckdb
 import pandas as pd
 
 PRICE_COLUMNS = (
-    "Date", "ISIN", "Symbol", "Open", "High", "Low", "Close",
+    "Date", "ISIN", "Symbol", "Series", "Open", "High", "Low", "Close",
     "Volume", "TurnoverINR", "Traded", "IsFrozenBar", "AdjustedThrough", "EngineQuarantined",
 )
 EVENT_COLUMNS = ("EventId", "ISIN", "Symbol", "ExDate", "PriceFactor", "VolumeFactor")
@@ -111,7 +111,24 @@ def append_sessions(paths: StatePaths, frame: pd.DataFrame) -> int:
     with duckdb.connect() as con:
         con.register("incoming", frame)
         if paths.prices.exists():
-            src = f"read_parquet('{paths.prices.as_posix()}')"
+            # Series column naya hai. Jo state file usse pehle bani thi usme wo
+            # nahi hoga, aur seedha UNION column-mismatch par phat jaata. Wahan
+            # 'EQ' likhna sach hai: tab intake BE/BZ leta hi nahi tha. Isse
+            # purani state bina dobara bootstrap kiye aage badh jaati hai.
+            stored = {
+                row[0] for row in con.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet"
+                    f"('{paths.prices.as_posix()}')"
+                ).fetchall()
+            }
+            columns = ", ".join(
+                c if c in stored else f"'EQ' AS {c}" if c == "Series" else c
+                for c in PRICE_COLUMNS
+            )
+            src = (
+                f"(SELECT {columns} FROM "
+                f"read_parquet('{paths.prices.as_posix()}'))"
+            )
             con.execute(
                 f"CREATE TABLE merged AS SELECT * FROM {src} "
                 "UNION ALL SELECT i.* FROM incoming i "

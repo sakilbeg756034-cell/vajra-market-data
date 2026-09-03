@@ -87,3 +87,54 @@ def test_the_two_cases_do_not_agree_by_accident(tmp_path: Path) -> None:
     )["Close"].tolist()
     raw = adjusted_frame(_store(tmp_path / "b", adjusted_through=None))["Close"].tolist()
     assert already != raw
+
+
+def test_a_state_file_written_before_series_existed_still_loads(tmp_path: Path) -> None:
+    """Cloud ki state file GitHub par pehle se maujood hai -- bina Series ke.
+
+    Jab Series column joda gaya to sabse bada khatra "galat jawab" nahi tha, wo
+    "koi jawab nahi" tha: agar padhne wala SQL seedha `p.Series` maangta, to
+    purani file par roz ka cloud run phat jaata aur sheet update hona hi band ho
+    jaati -- laptop band hone par mujhe pata bhi na chalta.
+
+    Purani file me har row EQ hi hai, kyunki tab intake BE/BZ leta hi nahi tha.
+    Isliye wahan 'EQ' maan lena andaza nahi, sach hai.
+    """
+    paths = _store(tmp_path, adjusted_through=None)
+    stored = pd.read_parquet(paths.prices)
+    assert "Series" not in stored.columns, "fixture jaan-boojh kar purani shakl me hai"
+
+    frame = adjusted_frame(paths)
+
+    assert "Series" in frame.columns
+    assert set(frame["Series"]) == {"EQ"}
+
+
+def test_new_sessions_append_onto_a_pre_series_state_file(tmp_path: Path) -> None:
+    """Purani state par naye din judne chahiye, phategi nahi.
+
+    `append_sessions` purani file aur nayi rows ko UNION karta hai. Column ki
+    ginti alag ho to wo wahin ruk jaata. Yahi rasta roz chalta hai, isliye ye
+    tootna sabse mehnga hota.
+    """
+    from vajra_regime.cloud.state import append_sessions
+
+    paths = _store(tmp_path, adjusted_through=None)
+
+    incoming = pd.DataFrame({
+        "Date": [pd.Timestamp("2026-03-31").date()],
+        "ISIN": ["INE000B01001"], "Symbol": ["BBB"], "Series": ["BE"],
+        "Open": [50.0], "High": [50.0], "Low": [50.0], "Close": [50.0],
+        "Volume": [10], "TurnoverINR": [500.0],
+        "Traded": [True], "IsFrozenBar": [True],
+        "AdjustedThrough": [pd.NaT], "EngineQuarantined": [False],
+    })
+
+    written = append_sessions(paths, incoming)
+    assert written == 1
+
+    merged = pd.read_parquet(paths.prices)
+    assert set(merged["Series"]) == {"EQ", "BE"}
+    # purani rows ko EQ mila, nayi row apni asli series ke saath aayi
+    assert merged.loc[merged["Symbol"] == "AAA", "Series"].eq("EQ").all()
+    assert merged.loc[merged["Symbol"] == "BBB", "Series"].eq("BE").all()
