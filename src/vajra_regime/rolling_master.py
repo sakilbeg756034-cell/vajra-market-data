@@ -100,6 +100,20 @@ def _build_next_table(connection: duckdb.DuckDBPyConnection, clean_table: str) -
         )
         delivery_join = ""
 
+    # Legacy snapshot ab apni Series khud rakhta hai (EQ + surveillance BE/BZ).
+    #
+    # Pehle wo EQ-only banaya gaya tha aur yahan seedha 'EQ' likh diya jaata
+    # tha. Ab wo snapshot dobara banaya ja chuka hai: 51,94,056 EQ rows bilkul
+    # waisi ki waisi, aur 4,54,779 BE/BZ rows jodi gayin jo pehle gayab thin.
+    #
+    # Jaanch phir bhi rakhi hai. Agar kabhi purana snapshot restore hua to wo
+    # bina Series ke aayega, aur us halat me 'EQ' likhna sach hi hai -- kyunki
+    # us snapshot me BE rows thi hi nahi.
+    legacy_columns = {
+        row[0] for row in connection.execute(f"DESCRIBE {LEGACY_TABLE}").fetchall()
+    } if _table_exists(connection, LEGACY_TABLE) else set()
+    legacy_series = "Series" if "Series" in legacy_columns else "'EQ' AS Series"
+
     connection.execute(f"DROP TABLE IF EXISTS {NEXT_TABLE}")
     connection.execute(
         f"""
@@ -117,12 +131,7 @@ def _build_next_table(connection: duckdb.DuckDBPyConnection, clean_table: str) -
                 CAST(TotalTrades AS DOUBLE) AS TotalTrades,
                 CAST(QuantityPerTrade AS DOUBLE) AS QuantityPerTrade,
                 CAST(DeliveryQuantity AS DOUBLE) AS DeliveryQuantity,
-                -- Legacy snapshot me Series column hai hi nahi, kyunki wo
-                -- EQ-only banaya gaya tha. 'EQ' likhna yahan sach hai: jo rows
-                -- MAUJOOD hain wo sach me EQ hain. Jo BE rows chhoot gaye wo
-                -- gayab hain -- aur unka lautna is snapshot ko dobara banane
-                -- par hi hoga, jo alag faisla hai.
-                'EQ' AS Series,
+                {legacy_series},
                 -- EOD2's feed is already split- and bonus-adjusted. The factor
                 -- below must not touch it; see the join condition in
                 -- adjusted_base.
