@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -103,6 +104,19 @@ def refresh_corporate_actions(paths: StatePaths, today: date) -> int:
     if normalized.empty:
         return 0
 
+    # NSE ka corporate action feed SYMBOL par aata hai, ISIN par nahi. Engine
+    # ISIN apne security master se nikalta hai; cloud ke paas wo nahi, isliye
+    # apne hi store se nikala jaata hai.
+    #
+    # Jahan ek symbol ek se zyada ISIN par laga hai wahan event CHHOD diya jaata
+    # hai, kisi ek par thopa nahi jaata. Poore dataset me 146 symbol aise hain,
+    # aur galat security par bonus factor lagana usse kaheen bura hai ki event
+    # chhoot jaye: chhoote hue event ka jhatka unexplained-break wale niyam me
+    # pakda jaata hai aur wo naam quarantine ho jaata hai.
+    normalized = _attach_isin(paths, normalized)
+    if normalized.empty:
+        return 0
+
     parsed = [ca.classify_adjustment(str(s)) for s in normalized["Subject"]]
     fresh = pd.DataFrame({
         "EventId": normalized["EventId"].astype(str),
@@ -120,10 +134,29 @@ def refresh_corporate_actions(paths: StatePaths, today: date) -> int:
         # Naya jawab jeetta hai: NSE kabhi-kabhi purana event sudharta hai.
         fresh = pd.concat([old[~old["EventId"].isin(fresh["EventId"])], fresh])
 
+    # Purani file aur naya batch alag dtype le kar aa sakte hain (date vs
+    # datetime vs object). Concat ke baad column object ban jaata hai aur
+    # sort_values type error deta hai -- isliye dono ko ek hi type par laate hain.
+    fresh["ExDate"] = pd.to_datetime(fresh["ExDate"], errors="coerce").dt.date
+    fresh = fresh[fresh["ExDate"].notna()]
     fresh = fresh.sort_values(["ExDate", "ISIN"]).reset_index(drop=True)
     paths.events.parent.mkdir(parents=True, exist_ok=True)
     fresh.to_parquet(paths.events, index=False)
     return int(len(fresh))
+
+
+def _attach_isin(paths: StatePaths, events: pd.DataFrame) -> pd.DataFrame:
+    """Symbol se ISIN nikalo -- sirf tab jab jawab ek hi ho."""
+    prices = pd.read_parquet(paths.prices, columns=["Symbol", "ISIN"])
+    pairs = prices.drop_duplicates()
+    counts = pairs.groupby("Symbol")["ISIN"].nunique()
+    unique = counts[counts == 1].index
+    lookup = (pairs[pairs["Symbol"].isin(unique)]
+              .drop_duplicates("Symbol").set_index("Symbol")["ISIN"])
+
+    out = events.copy()
+    out["ISIN"] = out["Symbol"].astype(str).str.upper().map(lookup)
+    return out[out["ISIN"].notna()].copy()
 
 
 def _seed_history(paths: StatePaths) -> pd.Series | None:
@@ -177,7 +210,10 @@ def run(root: Path, today: date, scratch: Path) -> dict:
     status = {
         "as_of_session": asof_date.isoformat(),
         "generated_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
-        "built_by": "github-actions",
+        # Jo file padhega use pata hona chahiye ki ye kahan bani. Hamesha
+        # "github-actions" likh dena ek chhota jhooth hai jo debug ke waqt
+        # mehnga padta hai.
+        "built_by": "github-actions" if os.environ.get("GITHUB_ACTIONS") else "laptop",
         "universe_rows": int(len(table)),
         "eligible": eligible,
         "n_holdings": signal.N_HOLDINGS,
