@@ -49,7 +49,12 @@ def _prices(published: Path, sessions: int) -> pd.DataFrame:
                 SELECT DISTINCT Date FROM read_parquet('{glob}')
                 ORDER BY Date DESC LIMIT {sessions}
             )
-            SELECT Date, ISIN, Symbol, Open, High, Low, Close,
+            SELECT Date, ISIN, Symbol,
+                   -- Published data 2026 se Series carry karta hai. Usse pehle
+                   -- ke saal EQ-only bane the, isliye wahan COALESCE sach hi
+                   -- bolta hai: jo rows maujood hain wo EQ hi hain.
+                   COALESCE(Series, 'EQ')          AS Series,
+                   Open, High, Low, Close,
                    CAST(Volume AS BIGINT)          AS Volume,
                    TurnoverINR,
                    Volume > 0                      AS Traded,

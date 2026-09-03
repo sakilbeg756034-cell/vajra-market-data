@@ -55,7 +55,7 @@ EXIT_RANK = 36
 SHORT_LOOKBACK = 63
 
 OUTPUT_COLUMNS = [
-    "RANK", "SYMBOL", "NAME", "SECTOR", "ISIN", "CLOSE", "SCORE",
+    "RANK", "SYMBOL", "NAME", "SECTOR", "ISIN", "SERIES", "CLOSE", "SCORE",
     "R12_PCT", "R6_PCT", "R3_PCT", "VOLATILITY_PCT", "VAM", "AGREE",
     "ATH", "ATH_DATE", "FROM_ATH_PCT",
     "ADTV_CR", "STALE_SESSIONS", "FROZEN_RATE", "ELIGIBLE",
@@ -67,6 +67,16 @@ def adjusted_frame(paths: StatePaths) -> pd.DataFrame:
     prices = paths.prices.as_posix()
     events = paths.events.as_posix()
     with duckdb.connect() as con:
+        # Series column naya hai. Jo state file usse pehle bani thi usme wo nahi
+        # hoga -- aur wahan 'EQ' likhna sach hai, kyunki tab intake BE/BZ leta
+        # hi nahi tha. Isse purani state bina dobara bootstrap kiye chalti rehti
+        # hai; naye din apni asli series ke saath aate hain.
+        stored = {
+            row[0] for row in con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{prices}')"
+            ).fetchall()
+        }
+        series_expr = "p.Series" if "Series" in stored else "'EQ' AS Series"
         return con.execute(
             f"""
             WITH ev AS (
@@ -98,6 +108,7 @@ def adjusted_frame(paths: StatePaths) -> pd.DataFrame:
                    -- doosre ke ulta hote hain, isliye ye gunanfal adjustment se
                    -- badalta hi nahi -- as-traded se ginna bhi wahi jawab deta.
                    p.Close * p.Volume            AS TurnoverINR,
+                   {series_expr},
                    p.Traded, p.IsFrozenBar,
                    p.EngineQuarantined, p.AdjustedThrough
             FROM p JOIN f ON f.d = p.Date AND f.i = p.ISIN
@@ -368,8 +379,15 @@ def rank_table(paths: StatePaths,
     frozen = core.frozen_rate(m["IsFrozenBar"], m["Traded"])
     stale = core.stale_reference_gap(m["Traded"])
 
-    symbols = (frame[frame["Date"] == asof]
-               .drop_duplicates("ISIN").set_index("ISIN")["Symbol"])
+    at_asof = frame[frame["Date"] == asof].drop_duplicates("ISIN").set_index("ISIN")
+    symbols = at_asof["Symbol"]
+    series_at_asof = (
+        at_asof["Series"].astype("string").str.upper()
+        if "Series" in at_asof.columns
+        # Purani state file me ye column nahi hoga. Us halat me sab EQ maana
+        # jaata hai -- jo sach bhi hai, kyunki tab BE rows aati hi nahi thin.
+        else pd.Series("EQ", index=at_asof.index, dtype="string")
+    )
 
     barred = quarantine(paths, frame, m["Close"], m["Traded"])
     live = member.loc[asof] & m["Traded"].loc[asof] & ~barred.loc[asof]
@@ -384,6 +402,7 @@ def rank_table(paths: StatePaths,
         "NAME": names,
         "SECTOR": sectors,
         "ISIN": universe,
+        "SERIES": series_at_asof.reindex(universe).fillna("EQ"),
         "CLOSE": m["Close"].loc[asof].reindex(universe).round(2),
         "SCORE": sc.loc[asof].reindex(universe).round(4),
         "R12_PCT": (r12.loc[asof].reindex(universe) * 100).round(4),
@@ -419,6 +438,17 @@ def rank_table(paths: StatePaths,
         & (df["STALE_SESSIONS"] <= MAX_STALE_SESSIONS)
         & (df["FROZEN_RATE"].fillna(0) <= MAX_FROZEN_RATE)
         & df["SCORE"].notna()
+        # Surveillance segment kharida nahi jaata.
+        #
+        # BE (trade-for-trade) aur BZ (non-compliant) me har sauda delivery me
+        # settle karna padta hai aur intraday mana hai. Aisa naam rank par aana
+        # jhootha bharosa deta -- sheet me wo top-12 me dikhta, par usse waise
+        # kharidna hota hi nahi jaise baaki naam.
+        #
+        # Un dino ka DATA phir bhi aata hai, warna price series me hole ban
+        # jaata hai aur R12/R6 jhuthe ho jaate hain. Data alag sawaal hai,
+        # trade alag.
+        & df["SERIES"].fillna("EQ").eq("EQ")
     )
     df["RANK"] = df["SCORE"].where(eligible).rank(ascending=False)
     df["ELIGIBLE"] = np.where(eligible, "HAAN", "NAHI")

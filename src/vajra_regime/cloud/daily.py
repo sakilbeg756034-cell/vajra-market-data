@@ -57,7 +57,7 @@ MIN_UNIVERSE_ROWS = 500
 
 
 def _bhavcopy_for(day: date, scratch: Path) -> pd.DataFrame | None:
-    """Ek din ki as-traded EQ rows. Chhutti par None.
+    """Ek din ki as-traded rows (EQ + surveillance BE/BZ). Chhutti par None.
 
     404 ka matlab chhutti ya abhi publish nahi hua -- wo galti nahi hai. Baaki har
     HTTP error upar uthta hai, kyunki "data nahi mila" ko chup-chaap "aaj koi
@@ -75,6 +75,9 @@ def _bhavcopy_for(day: date, scratch: Path) -> pd.DataFrame | None:
         "Date": pd.to_datetime(frame["Date"]).dt.date,
         "ISIN": frame["ISIN"].astype(str),
         "Symbol": frame["Symbol"].astype(str),
+        # BE/BZ rows yahan aati hain taaki price series me hole na bane. Wo
+        # tradeable nahi hain -- rok signal.py ke eligible mask me lagti hai.
+        "Series": frame["Series"].astype(str),
         "Open": frame["Open"].astype(float),
         "High": frame["High"].astype(float),
         "Low": frame["Low"].astype(float),

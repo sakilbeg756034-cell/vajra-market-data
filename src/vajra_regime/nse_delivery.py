@@ -47,7 +47,7 @@ import duckdb
 import pandas as pd
 
 from vajra_regime.config import AppConfig
-from vajra_regime.nse_live import USER_AGENT
+from vajra_regime.nse_live import TRADEABLE_SERIES, USER_AGENT
 
 DELIVERY_URL = (
     "https://nsearchives.nseindia.com/products/content/"
@@ -134,8 +134,11 @@ def fetch_delivery(trading_date: date) -> pd.DataFrame | None:
             f"sec_bhavdata_full for {trading_date} is missing columns: {missing}"
         )
 
+    # Price master ke saath ek hi series-set. Warna BE/BZ rows to aati hain par
+    # unki delivery khaali reh jaati -- aur wahi chuppi wapas aa jaati jise
+    # rokne ke liye ye file likhi gayi thi.
     frame["SERIES"] = frame["SERIES"].astype(str).str.strip().str.upper()
-    frame = frame.loc[frame["SERIES"] == "EQ"].copy()
+    frame = frame.loc[frame["SERIES"].isin(TRADEABLE_SERIES)].copy()
 
     # NSE CHHUTTI KE DIN PICHHLE DIN KA FILE DE DETA HAI -- HTTP 200 ke saath.
     #
@@ -182,11 +185,17 @@ def catch_up_delivery(
     start_date: date,
     end_date: date,
     database_path: str | Path | None = None,
+    refetch_existing: bool = False,
 ) -> dict[str, object]:
     """`start_date` se `end_date` tak jo din missing hain wahi laao.
 
     Jo din pehle se table me hai use dobara download nahi kiya jaata -- backfill
     beech me ruk jaye to dobara chalane par wo wahin se uthata hai.
+
+    `refetch_existing` un dino ko bhi dobara laata hai. Iski zaroorat tab padi
+    jab series-set badla: purane din EQ-only aaye the, aur unme BE/BZ ki
+    delivery baad me jodni thi. Insert (Date, Symbol) par anti-join karta hai,
+    isliye dobara chalana surakshit hai -- purani rows dohrai nahi jaatin.
     """
     path = Path(database_path or config.environment.duckdb_path)
     fetched, holidays, existing = [], [], []
@@ -204,7 +213,7 @@ def catch_up_delivery(
             if day.weekday() >= 5:            # NSE shanivaar-ravivaar band
                 day += timedelta(days=1)
                 continue
-            if day in have:
+            if day in have and not refetch_existing:
                 existing.append(day.isoformat())
                 day += timedelta(days=1)
                 continue
@@ -215,7 +224,14 @@ def catch_up_delivery(
             else:
                 connection.register("incoming_delivery", frame)
                 connection.execute(
-                    f"INSERT INTO {DELIVERY_TABLE} SELECT * FROM incoming_delivery"
+                    f"""
+                    INSERT INTO {DELIVERY_TABLE}
+                    SELECT i.* FROM incoming_delivery i
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM {DELIVERY_TABLE} e
+                        WHERE e.Date = i.Date AND e.Symbol = i.Symbol
+                    )
+                    """
                 )
                 connection.unregister("incoming_delivery")
                 fetched.append(day.isoformat())

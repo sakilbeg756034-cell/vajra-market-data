@@ -81,17 +81,36 @@ def test_a_partial_file_is_refused_rather_than_stored() -> None:
         nse_delivery.fetch_delivery(date(2026, 9, 2))
 
 
-def test_only_eq_series_survives() -> None:
-    """Government securities aur doosri series is strategy ka hissa nahi hain."""
-    mixed = _rows(600) + "\n" + "\n".join(
-        f"GS{i:04d}, GS, 02-Sep-2026, 100, 100, 101, 99, 100, 100, 100.5, "
-        "5000, 5.0, 250, 1000, 20.00" for i in range(50)
-    )
+def test_surveillance_series_kept_but_govt_securities_dropped() -> None:
+    """Delivery ka series-set price master ke BARABAR hona chahiye.
+
+    Price master ab EQ ke saath BE/BZ bhi rakhta hai, taaki surveillance ke daur
+    me stock apni hi price history se gayab na ho. Agar delivery sirf EQ laati
+    rahe to wo rows to aa jaatin par unki delivery khaali reh jaati -- yaani
+    wahi chuppi wapas, bas doosre column me. (Aisa hua bhi tha: 2026 ki delivery
+    coverage 100% se girkar 90.9% ho gayi thi, theek utni jitni BE/BZ rows thin.)
+
+    Government securities phir bhi bahar hi rehni chahiye.
+    """
+    def _block(prefix: str, series: str, count: int) -> str:
+        return "\n".join(
+            f"{prefix}{i:04d}, {series}, 02-Sep-2026, 100, 100, 101, 99, 100, "
+            "100, 100.5, 5000, 5.0, 250, 1000, 20.00" for i in range(count)
+        )
+
+    mixed = "\n".join([
+        _rows(600),
+        _block("GS", "GS", 50),
+        _block("BEX", "BE", 30),
+        _block("BZX", "BZ", 10),
+    ])
     with _serve(_csv(mixed)):
         frame = nse_delivery.fetch_delivery(date(2026, 9, 2))
 
-    assert set(frame["Series"]) == {"EQ"}
+    assert set(frame["Series"]) == {"EQ", "BE", "BZ"}
     assert not frame["Symbol"].str.startswith("GS").any()
+    assert int((frame["Series"] == "BE").sum()) == 30
+    assert int((frame["Series"] == "BZ").sum()) == 10
 
 
 def test_rows_from_another_date_are_dropped() -> None:
