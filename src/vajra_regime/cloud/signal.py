@@ -319,16 +319,29 @@ def rank_table(paths: StatePaths,
         "ISIN": universe,
         "CLOSE": m["Close"].loc[asof].reindex(universe).round(2),
         "SCORE": sc.loc[asof].reindex(universe).round(4),
-        "R12_PCT": (r12.loc[asof].reindex(universe) * 100).round(1),
-        "R6_PCT": (r6.loc[asof].reindex(universe) * 100).round(1),
-        "VOLATILITY_PCT": (vol.loc[asof].reindex(universe) * 100).round(1),
+        "R12_PCT": (r12.loc[asof].reindex(universe) * 100).round(4),
+        "R6_PCT": (r6.loc[asof].reindex(universe) * 100).round(4),
+        "VOLATILITY_PCT": (vol.loc[asof].reindex(universe) * 100).round(4),
         "ADTV_CR": (liquidity.loc[asof].reindex(universe) / 1e7).round(2),
         "STALE_SESSIONS": stale.loc[asof].reindex(universe),
         "FROZEN_RATE": frozen.loc[asof].reindex(universe).round(3),
     })
-    df["VAM"] = (df["R12_PCT"] / df["VOLATILITY_PCT"]).round(4)
-    df["AGREE"] = (((df["R6_PCT"] > 0).astype(float)
-                    + (df["R12_PCT"] > 0).astype(float)) / 2)
+    # VAM aur AGREE POORE number se, chhape hue number se nahi.
+    #
+    # Pehle ye dono R12_PCT / R6_PCT se bante the -- jo pehle hi ek dashamlav par
+    # round ho chuke the. Nateeja: AADHARHFC ka asli R6 thoda positive tha par
+    # "0.0%" par round ho gaya, isliye AGREE 0.5 ki jagah 0.0 chhapa, jabki SCORE
+    # (jo poore number se banta hai) 0.5 hi maan raha tha. File ke andar hi
+    # SCORE = VAM x AGREE ka hisaab nahi milta tha.
+    #
+    # Sheet me ye saaf dikh jaata: teen column saamne hote aur unka gunanfal
+    # chauthe se mel nahi khaata. Aisi cheez bharosa todti hai, chahe rank par
+    # koi asar na ho.
+    vam_raw = (r12 / vol.replace(0.0, np.nan)).loc[asof].reindex(universe)
+    agree_raw = (((r6 > 0).astype(float) + (r12 > 0).astype(float)) / 2)
+    agree_raw = agree_raw.where(r6.notna() & r12.notna()).loc[asof].reindex(universe)
+    df["VAM"] = vam_raw.round(4)
+    df["AGREE"] = agree_raw
 
     eligible = (
         (df["ADTV_CR"] >= MIN_ADTV_INR / 1e7)
