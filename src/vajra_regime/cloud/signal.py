@@ -42,11 +42,42 @@ LONG_GAP_DAYS = 30
 LONG_GAP_RETURN = 0.20
 
 # Strategy gates -- STRATEGY-RULEBOOK me locked.
+#
+# VAJRA V2, 4 September 2026 ko lock hui. Pehle 12 naam aur exit rank 36 tha.
+#
+# Kyun badla: survivorship-free data par 320 dhaanche aur 11 out-of-sample saal
+# (walk-forward, 2016-2026) test hue. Purana 12-naam wala dhaancha OOS par
+# 20.90% deta tha (cost ke baad), ye 27.84% deta hai. Aur uska poora nateeja
+# 411 me se sirf 20 naamo par tika tha (munafe ka 96.5%) -- yaani hunar kam,
+# kismat zyada. 20 naam par wo bhaar 56% par aa jaata hai.
 MIN_ADTV_INR = 2_500_000.0
 MAX_STALE_SESSIONS = 21
 MAX_FROZEN_RATE = 0.20
-N_HOLDINGS = 12
-EXIT_RANK = 36
+N_HOLDINGS = 20                     # V2: pehle 12
+EXIT_RANK = 50                      # V2: pehle 36  (20 x 2.5)
+
+# Ek naam me kitna zyada se zyada paisa. 20 naam par barabar baantne se har ek
+# 5% hota hai, isliye 15% ki hadd tabhi lagti hai jab kisi ka SCORE baaki sab se
+# bahut ooncha ho. Backtest me yahi hadd thi.
+MAX_WEIGHT = 0.15
+
+# Sabse volatile naam nahi kharide jaate.
+#
+# 252-din ki volatility ke hisaab se, us din ke ELIGIBLE naamo me jo sabse upar
+# ke 10% hain, wo nahi liye jaate. Naapa gaya (OOS 2016-2026, cost ke baad):
+#
+#     bina filter        26.76%   Sharpe 0.969
+#     is filter ke saath 27.84%   Sharpe 1.032
+#
+# EK BAAT JO JAAN-BOOJH KAR AISE HAI: percentile SIRF us din ke eligible naamo
+# me nikalta hai, poore panel me nahi.
+#
+# Backtest me pehle poore panel par rank liya gaya tha aur wo 29.09% deta tha --
+# 1.25 pp zyada. Par us tareeke ka jawab is baat par nirbhar karta hai ki panel
+# me aur kaun se naam pade hain, aur research panel aur live panel kabhi bilkul
+# ek jaise nahi hote. Yaani wo number live me hoobahoo dobara nahi banaya ja
+# sakta. Jo cheez dobara na ban sake, wo 1.25 pp ki nahi hoti.
+MAX_VOL_PERCENTILE = 0.90
 
 # 3 mahine ka return aur all-time high. Ye faisle me nahi aate -- SCORE me inka
 # koi hissa nahi -- par scanner me inke bina naam pehchana nahi jaata: "kitna
@@ -56,7 +87,9 @@ SHORT_LOOKBACK = 63
 
 OUTPUT_COLUMNS = [
     "RANK", "SYMBOL", "NAME", "SECTOR", "ISIN", "SERIES", "CLOSE", "SCORE",
-    "R12_PCT", "R6_PCT", "R3_PCT", "VOLATILITY_PCT", "VAM", "AGREE",
+    "WEIGHT_PCT",
+    "R12_PCT", "R6_PCT", "R3_PCT", "VOLATILITY_PCT", "VOL_RANK_PCT",
+    "VAM", "AGREE",
     "ATH", "ATH_DATE", "FROM_ATH_PCT",
     "ADTV_CR", "STALE_SESSIONS", "FROZEN_RATE", "ELIGIBLE",
 ]
@@ -450,10 +483,53 @@ def rank_table(paths: StatePaths,
         # trade alag.
         & df["SERIES"].fillna("EQ").eq("EQ")
     )
+
+    # Ab sabse volatile 10% naam nikaalo -- ELIGIBLE ke ANDAR se.
+    #
+    # Kram mayne rakhta hai: percentile UN naamo me nikalta hai jo baaki har
+    # shart paar kar chuke hain. Agar poore universe par nikaalte to cutoff wo
+    # naam tay karte jinhe waise bhi kharida nahi ja sakta.
+    #
+    # `rank(pct=True)` NaN chhod deta hai, isliye pehle non-eligible ko NaN
+    # kiya jaata hai. Ye ek line chup-chaap galat ho sakti thi.
+    vol_in_eligible = df["VOLATILITY_PCT"].where(eligible)
+    vol_rank = vol_in_eligible.rank(pct=True)
+    low_vol_enough = vol_rank.le(MAX_VOL_PERCENTILE)
+    # Jiska VOL hai hi nahi, wo waise bhi eligible nahi ho sakta.
+    df["VOL_RANK_PCT"] = vol_rank.round(4)
+    eligible = eligible & low_vol_enough.fillna(False)
+
     df["RANK"] = df["SCORE"].where(eligible).rank(ascending=False)
     df["ELIGIBLE"] = np.where(eligible, "HAAN", "NAHI")
     df = df.sort_values("RANK", na_position="last")
     df["RANK"] = df["RANK"].astype("Float64").round().astype("Int64")
+
+    # WEIGHT -- V2 me paisa barabar nahi, SCORE ke hisaab se bantata hai.
+    #
+    # Naapa gaya (OOS 2016-2026, cost ke baad): barabar baantne par 26.8%,
+    # score se baantne par 27.8%, aur Sharpe 0.97 se 1.03.
+    #
+    # Sirf top-N par lagta hai (jo sach me kharide jaate hain), aur MAX_WEIGHT
+    # ki hadd ke baad bacha hua hissa doosron me usi anupaat me baant diya
+    # jaata hai -- warna weight ka jod 100% se kam reh jaata aur portfolio me
+    # chup-chaap cash pada rehta.
+    df["WEIGHT_PCT"] = pd.NA
+    top = df["RANK"].notna() & (df["RANK"] <= N_HOLDINGS)
+    if top.any():
+        s = df.loc[top, "SCORE"].astype(float).clip(lower=0.0)
+        w = (s / s.sum()) if s.sum() > 0 else pd.Series(
+            1.0 / len(s), index=s.index)
+        for _ in range(10):                       # cap lagakar dobara baanto
+            over = w > MAX_WEIGHT
+            if not over.any():
+                break
+            spare = float((w[over] - MAX_WEIGHT).sum())
+            w[over] = MAX_WEIGHT
+            room = ~over
+            if not room.any() or w[room].sum() <= 0:
+                break
+            w[room] = w[room] + spare * (w[room] / w[room].sum())
+        df.loc[top, "WEIGHT_PCT"] = (w * 100).round(2)
     df["STALE_SESSIONS"] = (
         df["STALE_SESSIONS"].astype("Float64").round().astype("Int64")
     )
