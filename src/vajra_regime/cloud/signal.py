@@ -22,6 +22,18 @@ from vajra_regime.cloud import core
 from vajra_regime.cloud.state import StatePaths
 
 UNIVERSE_SIZE = 750
+# 252 HI RAHEGA -- 257 nahi.
+#
+# Ye UNIVERSE ka niyam hai (VAJRA 750 me kaun aayega), signal ka nahi.
+# Engine ka monthly_universe.py aur research ka mask dono 252 par hain.
+# Ise 257 karne par cloud ka universe research se ALAG ho jaata -- aur
+# wo farq kahin error nahi deta, bas dono jagah alag naam aane lagte.
+# (7-Sep-2026 ko skip=5 jodte waqt ye galti ho kar pakdi gayi thi.)
+#
+# skip=5 ke liye jo 257 session chahiye wo apne aap sambhal jaata hai:
+# jis naam ke paas 257 session nahi hain uska SCORE NaN aata hai, aur
+# neeche `df["SCORE"].notna()` use ELIGIBLE se bahar kar deta hai.
+# Shart wahin lagni chahiye jahan uska asar hai.
 MIN_HISTORY_SESSIONS = 252
 MIN_TURNOVER_OBSERVATIONS = 40
 STALE_CALENDAR_DAYS = 7
@@ -41,20 +53,21 @@ UNRATIOED_ACTION_TYPES = ("RIGHTS", "MERGER", "DEMERGER", "SPLIT", "BONUS")
 LONG_GAP_DAYS = 30
 LONG_GAP_RETURN = 0.20
 
-# Strategy gates -- STRATEGY-RULEBOOK me locked.
+# Strategy gates -- `LOCKED_STRATEGY_V2.json` me locked.
 #
-# VAJRA V2, 4 September 2026 ko lock hui. Pehle 12 naam aur exit rank 36 tha.
+# YE VALUE YAHAN HARDCODED HONI HI CHAHIYE: ye file GitHub Actions par chalti
+# hai, jahan lock file maujood hi nahi hoti. Isliye inhe lock file se milaane
+# ka kaam `verify_system.py` (hissa 3) karta hai -- wo teenon jagah (lock,
+# engine, sheet) ka number aapas me milaata hai.
 #
-# Kyun badla: survivorship-free data par 320 dhaanche aur 11 out-of-sample saal
-# (walk-forward, 2016-2026) test hue. Purana 12-naam wala dhaancha OOS par
-# 20.90% deta tha (cost ke baad), ye 27.84% deta hai. Aur uska poora nateeja
-# 411 me se sirf 20 naamo par tika tha (munafe ka 96.5%) -- yaani hunar kam,
-# kismat zyada. 20 naam par wo bhaar 56% par aa jaata hai.
+# Kyun 20 naam: kam naamo wale portfolio ka poora munafa mutthi bhar stocks par
+# tik jaata hai -- naapa gaya, 411 me se sirf 20 naam par 96.5%. Wo hunar nahi,
+# kismat hai. 20 naam par ye bhaar 56% par aa jaata hai, aur CAGR bhi behtar.
 MIN_ADTV_INR = 2_500_000.0
 MAX_STALE_SESSIONS = 21
 MAX_FROZEN_RATE = 0.20
-N_HOLDINGS = 20                     # V2: pehle 12
-EXIT_RANK = 50                      # V2: pehle 36  (20 x 2.5)
+N_HOLDINGS = 20
+EXIT_RANK = 50                      # = N_HOLDINGS x buffer 2.5
 
 # Ek naam me kitna zyada se zyada paisa. 20 naam par barabar baantne se har ek
 # 5% hota hai, isliye 15% ki hadd tabhi lagti hai jab kisi ka SCORE baaki sab se
@@ -64,19 +77,23 @@ MAX_WEIGHT = 0.15
 # Sabse volatile naam nahi kharide jaate.
 #
 # 252-din ki volatility ke hisaab se, us din ke ELIGIBLE naamo me jo sabse upar
-# ke 10% hain, wo nahi liye jaate. Naapa gaya (OOS 2016-2026, cost ke baad):
+# ke 10% hain, wo nahi liye jaate. Naapa gaya (2016 se aage, cost ke baad):
 #
-#     bina filter        26.76%   Sharpe 0.969
-#     is filter ke saath 27.84%   Sharpe 1.032
+#     bina filter        29.45%  Sharpe 1.06
+#     is filter ke saath 31.34%  Sharpe 1.17
 #
-# EK BAAT JO JAAN-BOOJH KAR AISE HAI: percentile SIRF us din ke eligible naamo
+# (7-Sep-2026 par skip=5 ke saath dobara naapa gaya. Us se pehle ye
+#  25.7% aur 26.8% the -- wo skip=0 ke number the.)
+#
+# EK BAAT JO JAAN-BOOJH KAR AISE HAI: percentile SIRF us din ke ELIGIBLE naamo
 # me nikalta hai, poore panel me nahi.
 #
-# Backtest me pehle poore panel par rank liya gaya tha aur wo 29.09% deta tha --
-# 1.25 pp zyada. Par us tareeke ka jawab is baat par nirbhar karta hai ki panel
-# me aur kaun se naam pade hain, aur research panel aur live panel kabhi bilkul
-# ek jaise nahi hote. Yaani wo number live me hoobahoo dobara nahi banaya ja
-# sakta. Jo cheez dobara na ban sake, wo 1.25 pp ki nahi hoti.
+# 6 September 2026 tak research ka code POORE PANEL par rank karta tha, jabki
+# ye file eligible me. Do alag strategy chal rahi thin aur koi error nahi aata
+# tha -- bas backtest 2.8 pp zyada dikhata tha. Ab research bhi yahi karta hai
+# (`fastbt.run` me `cfg.max_vol_pct`).
+#
+# Ye file SAHI thi. Galat research ka code tha.
 MAX_VOL_PERCENTILE = 0.90
 
 # 3 mahine ka return aur all-time high. Ye faisle me nahi aate -- SCORE me inka
@@ -88,7 +105,8 @@ SHORT_LOOKBACK = 63
 OUTPUT_COLUMNS = [
     "RANK", "SYMBOL", "NAME", "SECTOR", "ISIN", "SERIES", "CLOSE", "SCORE",
     "WEIGHT_PCT",
-    "R12_PCT", "R6_PCT", "R3_PCT", "VOLATILITY_PCT", "VOL_RANK_PCT",
+    "R12_PCT", "R12_SKIP_PCT", "R6_PCT", "R3_PCT", "VOLATILITY_PCT",
+    "VOL_RANK_PCT",
     "VAM", "AGREE",
     "ATH", "ATH_DATE", "FROM_ATH_PCT",
     "ADTV_CR", "STALE_SESSIONS", "FROZEN_RATE", "ELIGIBLE",
@@ -404,13 +422,23 @@ def rank_table(paths: StatePaths,
     member = vajra750_membership(frame, seed_history)
 
     sc = core.score(m["Close"])
+    # DO alag R12 -- inhe mila dena hi wo galti hai jise 7-Sep-2026 ke skip=5
+    # ke saath rokna hai:
+    #   r12       -> AGREE ke liye (aaj tak). Sheet me "R12 %" yahi hai.
+    #   r12_mag   -> VAM ke liye (paanch session pehle tak). Sheet me
+    #                "R12 SKIP %". VAM = r12_mag / VOL, r12 / VOL NAHI.
     r12 = core.total_return(m["Close"], core.LONG_LOOKBACK)
+    r12_mag = core.total_return(m["Close"], core.LONG_LOOKBACK, core.SKIP_SESSIONS)
     r6 = core.total_return(m["Close"], core.SHORT_LOOKBACK)
     r3 = core.total_return(m["Close"], SHORT_LOOKBACK)
     vol = core.realised_vol(m["Close"])
     liquidity = core.adtv(m["TurnoverINR"])
     frozen = core.frozen_rate(m["IsFrozenBar"], m["Traded"])
-    stale = core.stale_reference_gap(m["Traded"])
+    # STALE ab us bhaav ko naapta hai jo VAM SACH ME use karta hai, yaani
+    # t-257 wala -- t-252 wala nahi. Warna ye gate us bhaav ki jaanch karta
+    # jispar score tika hi nahi hai.
+    stale = core.stale_reference_gap(
+        m["Traded"], core.LONG_LOOKBACK + core.SKIP_SESSIONS)
 
     at_asof = frame[frame["Date"] == asof].drop_duplicates("ISIN").set_index("ISIN")
     symbols = at_asof["Symbol"]
@@ -439,6 +467,7 @@ def rank_table(paths: StatePaths,
         "CLOSE": m["Close"].loc[asof].reindex(universe).round(2),
         "SCORE": sc.loc[asof].reindex(universe).round(4),
         "R12_PCT": (r12.loc[asof].reindex(universe) * 100).round(4),
+        "R12_SKIP_PCT": (r12_mag.loc[asof].reindex(universe) * 100).round(4),
         "R6_PCT": (r6.loc[asof].reindex(universe) * 100).round(4),
         "R3_PCT": (r3.loc[asof].reindex(universe) * 100).round(4),
         "ATH": ath.round(2),
@@ -460,7 +489,7 @@ def rank_table(paths: StatePaths,
     # Sheet me ye saaf dikh jaata: teen column saamne hote aur unka gunanfal
     # chauthe se mel nahi khaata. Aisi cheez bharosa todti hai, chahe rank par
     # koi asar na ho.
-    vam_raw = (r12 / vol.replace(0.0, np.nan)).loc[asof].reindex(universe)
+    vam_raw = (r12_mag / vol.replace(0.0, np.nan)).loc[asof].reindex(universe)
     agree_raw = (((r6 > 0).astype(float) + (r12 > 0).astype(float)) / 2)
     agree_raw = agree_raw.where(r6.notna() & r12.notna()).loc[asof].reindex(universe)
     df["VAM"] = vam_raw.round(4)

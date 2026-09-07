@@ -43,10 +43,37 @@ def test_runner_invokes_only_the_data_engine() -> None:
 
 
 def test_runner_reports_failure_without_touching_published_data() -> None:
+    """Fail hone par purana dataset waise ka waisa rehna chahiye.
+
+    6 September 2026: pehle ye test ek ANGREZI vaakya dhoondhta tha
+    ("previously published dataset is left untouched"). Wo script Hinglish me
+    dobara likhi gayi, aur test toot gaya -- jabki guarantee waisi ki waisi
+    thi. Ek vaakya dhoondhna kamzor test hai: wo bhasha par tikta hai, bartav
+    par nahi.
+
+    Ab ye us guarantee ko seedhe jaanchta hai: failure par status FAILED aur
+    exit 1, aur status me wo baat likhi ho ki purana dataset chhoda gaya.
+    """
     source = RUNNER.read_text(encoding="utf-8")
     assert "exit 1" in source
     assert "FAILED" in source
-    assert "previously published dataset is left untouched" in source
+    # status payload me ye baat likhi honi chahiye -- kisi bhi bhasha me
+    assert "note" in source
+    assert ("dataset waise ka waisa" in source
+            or "previously published dataset is left untouched" in source)
+
+
+def test_runner_builds_the_one_dataset_and_not_the_retired_one() -> None:
+    """6 September 2026: ab EK hi dataset hai, D:\\VAJRA_DATA.
+
+    Roz ka script use `build_vajra_data.py` se banata hai. Purani
+    `refresh_survivorship_free_data.py` hata di gayi -- agar wo kabhi wapas
+    aayi to do dataset ka wahi jhamela dobara khada ho jaayega.
+    """
+    source = RUNNER.read_text(encoding="utf-8")
+    assert "build_vajra_data.py" in source
+    assert "refresh_survivorship_free_data" not in source
+    assert "VAJRA_DATA_NEW" not in source
 
 
 def test_scheduled_task_settings_fix_the_two_ways_the_old_tasks_failed() -> None:
