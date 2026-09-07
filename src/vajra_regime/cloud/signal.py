@@ -80,7 +80,7 @@ MAX_WEIGHT = 0.15
 # ke 10% hain, wo nahi liye jaate. Naapa gaya (2016 se aage, cost ke baad):
 #
 #     bina filter        29.45%  Sharpe 1.06
-#     is filter ke saath 31.34%  Sharpe 1.17
+#     is filter ke saath 31.39%  Sharpe 1.17
 #
 # (7-Sep-2026 par skip=5 ke saath dobara naapa gaya. Us se pehle ye
 #  25.7% aur 26.8% the -- wo skip=0 ke number the.)
