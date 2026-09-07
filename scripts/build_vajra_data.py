@@ -54,11 +54,27 @@ SCRIPTS = Path(r"D:\VAJRA_RESEARCH\work\scripts")
 PYTHON = Path(r"D:\VAJRA_ENGINE\venv\Scripts\python.exe")
 TARGET = Path(r"D:\VAJRA_DATA")
 
+# (label, script, kya FAIL hone par ruk jaana hai)
 STEPS = [
-    ("kachcha panel (NSE bhavcopy se)", "build_raw_panel.py"),
-    ("sthir company pehchaan", "build_identity.py"),
-    ("corporate action adjustment", "build_adjusted_panel.py"),
-    ("D:\\VAJRA_DATA publish karo (parquet + CSV)", "publish_vajra_data.py"),
+    # KADAM 0 -- 7 September 2026 ko joda gaya.
+    #
+    # Ye NSE se naye corporate action laata hai. Pehle ye chain me tha hi
+    # nahi, aur us script me END ki tareekh HARDCODED thi (2026-09-03).
+    # Nateeja: us din ke baad ka koi split/bonus adjustment me aata hi nahi
+    # tha -- aur dataset bina kisi error ke publish ho jaata tha. Ek chhoota
+    # hua split us naam ke bhaav me jhootha -50% giraav banata hai, aur
+    # momentum use turant 'sabse bura' samajh kar bech deta hai.
+    #
+    # roko=False: NSE ka feed kabhi-kabhi jawab nahi deta. Ek din ka fail
+    # poore dataset ko nahi rokna chahiye -- purana CA data abhi bhi theek
+    # hai. Par agar wo 7 din se zyada purana ho jaye to aakhri kadam ka
+    # `ca_freshness_gate` publish rok deta hai. Der maaf hai; purana data
+    # chup-chaap chalte rehna maaf nahi.
+    ("NSE se naye corporate action laao", "fetch_ca_history.py", False),
+    ("kachcha panel (NSE bhavcopy se)", "build_raw_panel.py", True),
+    ("sthir company pehchaan", "build_identity.py", True),
+    ("corporate action adjustment", "build_adjusted_panel.py", True),
+    ("D:\\VAJRA_DATA publish karo (parquet + CSV)", "publish_vajra_data.py", True),
 ]
 
 
@@ -72,14 +88,14 @@ def main() -> int:
     if not PYTHON.exists():
         print(f"!! Python nahi mila: {PYTHON}")
         return 1
-    missing = [f for _, f in STEPS if not (SCRIPTS / f).exists()]
+    missing = [f for _, f, _ in STEPS if not (SCRIPTS / f).exists()]
     if missing:
         print(f"!! ye script nahi mili: {missing}")
         print(f"   dekhi gayi jagah: {SCRIPTS}")
         return 1
 
     t0 = time.time()
-    for i, (label, fname) in enumerate(STEPS, 1):
+    for i, (label, fname, roko) in enumerate(STEPS, 1):
         print("-" * 88)
         print(f"KADAM {i}/{len(STEPS)} : {label}")
         print("-" * 88, flush=True)
@@ -92,9 +108,15 @@ def main() -> int:
             print(proc.stdout[-6000:] if proc.stdout else "")
             print(proc.stderr[-4000:] if proc.stderr else "")
             print(f"\n!! KADAM {i} FAIL ({fname}), exit {proc.returncode}")
-            print("   PURANA dataset waise ka waisa hai -- kuch bigda nahi.")
-            print("   Upar ka error padho, theek karo, dobara chalao.")
-            return 1
+            if roko:
+                print("   PURANA dataset waise ka waisa hai -- kuch bigda nahi.")
+                print("   Upar ka error padho, theek karo, dobara chalao.")
+                return 1
+            print("   Ye kadam ROKNE wala nahi hai -- aage badh rahe hain.")
+            print("   Agar iski wajah se data purana reh gaya, to aakhri kadam")
+            print("   ka gate publish khud rok dega. Der maaf hai; chup-chaap")
+            print("   purana data chalte rehna maaf nahi.", flush=True)
+            continue
         tail = [ln for ln in (proc.stdout or "").rstrip().split("\n") if ln.strip()]
         for ln in tail[-8:]:
             print("   " + ln)
