@@ -79,8 +79,11 @@ MAX_WEIGHT = 0.15
 # 252-din ki volatility ke hisaab se, us din ke ELIGIBLE naamo me jo sabse upar
 # ke 10% hain, wo nahi liye jaate. Naapa gaya (2016 se aage, cost ke baad):
 #
-#     bina filter        29.45%  Sharpe 1.06
-#     is filter ke saath 31.39%  Sharpe 1.17
+#     bina filter        30.57%  Sharpe 1.076  MaxDD -42.9%
+#     is filter ke saath 31.39%  Sharpe 1.165  MaxDD -44.3%
+#
+# Dhyan do: MaxDD is filter ke saath THODA KHARAB hota hai. Filter
+# isliye hai ki risk-adjusted return (Sharpe) saaf behtar hai.
 #
 # (7-Sep-2026 par skip=5 ke saath dobara naapa gaya. Us se pehle ye
 #  25.7% aur 26.8% the -- wo skip=0 ke number the.)
