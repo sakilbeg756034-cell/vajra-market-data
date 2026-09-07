@@ -77,7 +77,13 @@ def check_files():
     head("1. WO FILE JO HONI HI CHAHIYE")
     must = [
         (GATE / "VAJRA_SYSTEM.md", "poore system ka naksha"),
-        (GATE / "VAJRA_MOMENTUM_STRATEGY.pdf", "strategy ka PDF"),
+        # 7-Sep-2026: yahan PDF thi. Uske number chaar peedhi purane ho
+        # chuke the (29.59% / 26.82%) aur ye jaanch phir bhi PASS deti
+        # thi -- kyunki ye sirf "file hai ya nahi" dekhti hai, andar kya
+        # likha hai wo nahi. PDF archive me chali gayi; ab uski jagah
+        # Markdown hai, jise check_stale_numbers.py bhi chhaanta hai.
+        (GATE / "VAJRA_STRATEGY_SAMJHAO.md", "strategy aasan bhasha me"),
+        (GATE / "START_HERE_AI.md", "poore system ka darwaza"),
         (GATE / "KABHI_DELETE_MAT_KARNA.md", "delete na karne wali list"),
         (LOCK, "locked strategy"),
         (SHEET_DIR / "VajraMomentumScanner.gs", "sheet ka script"),
