@@ -299,3 +299,81 @@ def test_engine_quarantine_saal_bhar_nahi_chalta(tmp_path: Path) -> None:
         "engine ne suljha diya tha; uske BAAD naam bandh nahi rehna chahiye. "
         "252-session ka blackout sirf un niyamo par lagta hai jo cloud khud pakadta hai."
     )
+
+
+def test_rank_tie_par_top_me_ek_extra_naam_nahi_aata(tmp_path: Path, monkeypatch) -> None:
+    """RANK tie hone par bhi `top` me theek N naam aane chahiye.
+
+    8 September 2026 ke audit me pakdi gayi. `rank_table` pehle ROUND HO CHUKE
+    SCORE par `.rank(ascending=False)` lagata tha, jiska default method
+    `average` hai, aur phir rank ko bhi round karta tha. Do naam ka rounded
+    SCORE barabar hote hi dono ko 2.5 jaisa aadha rank milta aur `.round()`
+    (banker's rounding) dono ko 2 bana deta.
+
+    Naapa gaya (7-Sep-2026 ki asli live file): 660 ranked naam par sirf 500
+    alag rank -- yaani 160 duplicate. Us din sabse upar wala duplicate rank
+    178 par tha, isliye kisi ko dikha nahi.
+
+    Par `top` ki shart `RANK <= N_HOLDINGS` hai. Rank 20 par tie hote hi
+    `top` me 21 naam aa jaate aur weight 21 me bant jaata -- yaani live 21
+    naam rakhta jabki backtest 20. `fastbt.py` (jisne locked number banaye)
+    `np.argsort(-s, kind="stable")` se hamesha THEEK N leta hai.
+
+    Yahan B aur C bilkul ek jaisi series hain, isliye unka SCORE bit-par-bit
+    barabar hai -- sabse sakht tie. N_HOLDINGS 2 par rakha gaya hai taaki
+    tie theek hadd par pade.
+    """
+    from vajra_regime.cloud import signal as sig
+
+    monkeypatch.setattr(sig, "N_HOLDINGS", 2)
+
+    paths = StatePaths(tmp_path)
+    paths.prices.parent.mkdir(parents=True, exist_ok=True)
+    din = pd.bdate_range("2025-01-01", periods=280)
+
+    def bhaav(name: str, i: int) -> float:
+        if name == "AAA":                     # seedhi chadhai -> vol kam, score sabse upar
+            return 100.0 * (1.002 ** i) * (1.001 if i % 2 else 0.999)
+        # BBB aur CCC bilkul ek jaise -- jhatkedaar, kam badhat
+        return 100.0 * (1.0005 ** i) * (1.02 if i % 2 else 0.98)
+
+    rows = []
+    for isin, name in (("INE000A01001", "AAA"), ("INE000A01019", "BBB"),
+                       ("INE000A01027", "CCC")):
+        for i, d in enumerate(din):
+            px = bhaav(name, i)
+            rows.append({
+                "Date": d.date(), "ISIN": isin, "Symbol": name, "Series": "EQ",
+                "Open": px, "High": px, "Low": px, "Close": px,
+                # ADTV `Close x Volume` se banta hai, TurnoverINR se nahi.
+                # 100 x 10 lakh = 10 Cr -- 0.25 Cr ke farsh se aaram se upar.
+                "Volume": 1_000_000, "TurnoverINR": 50_000_000.0,
+                "Traded": True, "IsFrozenBar": False,
+                "AdjustedThrough": din[-1].date(), "EngineQuarantined": False,
+            })
+    pd.DataFrame(rows).to_parquet(paths.prices, index=False)
+    pd.DataFrame({
+        "EventId": [], "ISIN": [], "Symbol": [], "ExDate": [],
+        "PriceFactor": [], "VolumeFactor": [], "ActionType": [], "ParseStatus": [],
+    }).to_parquet(paths.events, index=False)
+
+    df = sig.rank_table(paths)
+
+    ranked = df[df["RANK"].notna()]
+    score = dict(zip(ranked["SYMBOL"], ranked["SCORE"], strict=False))
+    assert score["BBB"] == score["CCC"], "test ka apna aadhaar: dono ka SCORE barabar ho"
+
+    assert not ranked["RANK"].duplicated().any(), (
+        "tie par bhi har naam ka apna rank hona chahiye -- warna round hokar "
+        "do naam ek hi rank par aa jaate hain"
+    )
+    top = ranked[ranked["RANK"] <= 2]
+    assert len(top) == 2, (
+        f"top-2 me {len(top)} naam aa gaye. Tie par ek EXTRA naam khareed liya "
+        f"jaata -- aur weight bhi usi me bant jaata."
+    )
+    assert list(ranked.sort_values("RANK")["SYMBOL"])[0] == "AAA"
+    # weight sirf top-2 me, aur poora 100%
+    w = df["WEIGHT_PCT"].dropna()
+    assert len(w) == 2
+    assert float(w.sum()) == pytest.approx(100.0, abs=0.05)

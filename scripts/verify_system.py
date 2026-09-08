@@ -370,6 +370,124 @@ def check_live():
     except Exception as exc:                                          # noqa: BLE001
         bad("status.json padha nahi gaya", str(exc)[:90])
 
+    check_published_csv()
+
+
+# ==================================================================== 4b
+def check_published_csv():
+    """PUBLISH KI GAYI file ke ANDAR ka number bhi jaancho -- sirf column nahi.
+
+    8 September 2026 ke audit me ye kami pakdi gayi, aur wo mehngi thi.
+
+    Us waqt do gate the aur DONO is file se chook rahe the:
+      * upar wala hissa sirf ye dekhta tha ki CSV me column maujood hain aur
+        tareekh taaza hai -- andar ka number sahi hai ya nahi, wo nahi.
+      * `reconcile.py` cloud ka signal laptop par DOBARA banata hai; publish
+        ki gayi file wo padhta hi nahi.
+
+    Nateeja us din khud dikh gaya. 07:22 baje BE/BZ ka fix push hua, par
+    aakhri cloud run us se pehle (2026-09-07 19:24 UTC) chala tha. Poore din
+    sheet me HFCL RANK 3 par, WEIGHT 6.20%, `SERIES = EQ`, `ELIGIBLE = HAAN`
+    khada raha -- jabki cloud ke apne store me wo 3-Sep se BE hai. Dono gate
+    PASS de rahe the.
+
+    Isliye ye jaanch WAHI file padhti hai jo sheet padhti hai, aur use cloud
+    ke apne store se milaati hai. Jo file operator dekhta hai, gate usi file
+    ko dekhe -- uske jaise kisi doosre hisaab ko nahi.
+    """
+    import pandas as pd                                           # noqa: PLC0415
+
+    # N aur exit-rank LOCK FILE se -- yahan haath se likhne ka matlab hota ek
+    # aur jagah jo chup-chaap khisak jaati.
+    try:
+        spec = json.loads(LOCK.read_text(encoding="utf-8"))["final_spec"]
+        n_holdings = int(spec["n"])
+        exit_rank = int(spec["n"] * spec["buffer"])
+    except Exception as exc:                                          # noqa: BLE001
+        bad("lock file se n/exit_rank nahi mila", str(exc)[:90])
+        return
+
+    repo = SHEET_DIR / "vajra-signals"
+    csv_path = repo / "out/latest_signals.csv"
+
+    # Cloud se hi utaaro -- local clone tabhi taaza hoti hai jab koi `git pull`
+    # kare, aur wahi chuppi upar wale hisse ko 8-Sep ko dhokha de chuki hai.
+    src = "local copy"
+    try:
+        import io                                                 # noqa: PLC0415
+        import urllib.request                                     # noqa: PLC0415
+        url = ("https://raw.githubusercontent.com/sakilbeg756034-cell/"
+               "vajra-signals/main/out/latest_signals.csv")
+        with urllib.request.urlopen(url, timeout=30) as resp:      # noqa: S310
+            live = pd.read_csv(io.StringIO(resp.read().decode("utf-8")))
+        src = "cloud"
+    except Exception as exc:                                          # noqa: BLE001
+        warn("cloud se latest_signals.csv nahi mili",
+             f"{str(exc)[:60]} -- local copy par jaanch ho rahi hai")
+        if not csv_path.exists():
+            bad("publish ki gayi CSV kahin nahi mili", str(csv_path))
+            return
+        live = pd.read_csv(csv_path)
+
+    ranked = live[live["RANK"].notna()]
+
+    # --- 1. RANK apne aap me theek hai? -------------------------------------
+    dupes = int(ranked["RANK"].duplicated().sum())
+    (ok if dupes == 0 else bad)(
+        f"live CSV: RANK me duplicate nahi ({src})",
+        f"{len(ranked)} ranked naam, {ranked['RANK'].nunique()} alag rank"
+        + ("" if dupes == 0 else f" -- {dupes} duplicate, SCORE tie par rank "
+                                 "round ho raha hai"))
+
+    n_top = int((ranked["RANK"] <= n_holdings).sum())
+    want_top = min(n_holdings, len(ranked))
+    (ok if n_top == want_top else bad)(
+        f"live CSV: top-{n_holdings} me theek {want_top} naam",
+        f"{n_top} mile"
+        + ("" if n_top == want_top else " -- tie par ek EXTRA naam khareeda "
+                                        "jaata hai, aur weight bhi usme bantta hai"))
+
+    # --- 2. WEIGHT ----------------------------------------------------------
+    w = live["WEIGHT_PCT"].dropna()
+    w_sum, w_max = float(w.sum()), (float(w.max()) if len(w) else 0.0)
+    (ok if abs(w_sum - 100.0) <= 0.5 else bad)(
+        "live CSV: weight ka jod 100%", f"{w_sum:.2f}% ({len(w)} naam par)")
+    (ok if w_max <= 15.05 else bad)(
+        "live CSV: kisi naam me 15% se zyada nahi", f"sabse bada {w_max:.2f}%")
+
+    # --- 3. Sabse zaroori: SERIES cloud ke apne STORE se milta hai? ---------
+    #
+    # Yahi wo jaanch hai jo HFCL ko pakadti. CSV apna SERIES khud likhti hai,
+    # aur wo galat ho sakta hai; store me NSE ka apna bhavcopy pada hai.
+    store = repo / "state/prices.parquet"
+    if not store.exists():
+        warn("cloud store nahi mila, SERIES ka milaan nahi hua", str(store))
+        return
+    px = pd.read_parquet(store, columns=["Date", "Symbol", "Series"])
+    asof = px["Date"].max()
+    truth = (px[px["Date"] == asof].drop_duplicates("Symbol")
+             .set_index("Symbol")["Series"])
+    joined = live.assign(TRUE_SERIES=live["SYMBOL"].map(truth))
+    checked = joined[joined["TRUE_SERIES"].notna()]
+    mismatch = checked[checked["SERIES"] != checked["TRUE_SERIES"]]
+    traded = mismatch[mismatch["RANK"].notna()
+                      & (mismatch["RANK"] <= exit_rank)]
+    (ok if len(traded) == 0 else bad)(
+        "live CSV: SERIES cloud ke store se milta hai (rank 1-%d)" % exit_rank,
+        f"{len(checked)} naam milaye, {len(mismatch)} par farq, "
+        f"{len(traded)} trade ke dayre me"
+        + ("" if len(traded) == 0 else " -- " + ", ".join(
+            f"{r.SYMBOL} rank {int(r.RANK)}: CSV {r.SERIES} par store "
+            f"{r.TRUE_SERIES}" for r in traded.head(5).itertuples())))
+
+    be_bz = checked[checked["RANK"].notna()
+                    & checked["TRUE_SERIES"].isin(["BE", "BZ"])]
+    (ok if len(be_bz) == 0 else bad)(
+        "live CSV: koi BE/BZ naam rank par nahi",
+        "0 mila" if len(be_bz) == 0 else ", ".join(
+            f"{r.SYMBOL} (rank {int(r.RANK)}, {r.TRUE_SERIES})"
+            for r in be_bz.head(5).itertuples()))
+
 
 # ==================================================================== 5
 def check_engine_tests():

@@ -695,10 +695,47 @@ def rank_table(paths: StatePaths,
     df["VOL_RANK_PCT"] = vol_rank.round(4)
     eligible = eligible & low_vol_enough.fillna(False)
 
-    df["RANK"] = df["SCORE"].where(eligible).rank(ascending=False)
+    # RANK: BINA ROUND KIYE SCORE par, aur tie par bhi hamesha alag rank.
+    #
+    # 8-Sep-2026 ko pakdi gayi. Pehle yahan `df["SCORE"]` tha -- jo upar
+    # `.round(4)` ho chuka hai -- aur `.rank(ascending=False)` ka default
+    # method `average` hai. Do naam ka rounded SCORE barabar hote hi dono ko
+    # 178.5 jaisa aadha rank milta, aur agli line ka `.round()` (banker's
+    # rounding) dono ko 178 bana deta. Naapa gaya (7-Sep ki live file):
+    # 660 ranked naam par 500 hi alag rank -- yaani 160 duplicate.
+    #
+    # Neeche se dekhne me ye bekaar lagta hai (sabse upar wala duplicate 178
+    # par tha). Par `top` ki shart `RANK <= N_HOLDINGS` hai. Rank 20 par tie
+    # hote hi `top` me **21 naam** aa jaate aur weight 21 me bant jaata --
+    # yaani live 21 naam rakhta jabki backtest 20. Us din rank 1-60 me do
+    # lagatar SCORE ka sabse chhota farq 0.0006 tha, yaani tie se sirf 6
+    # rounding-kadam door.
+    #
+    # `fastbt.py` (jisne locked number banaye) `np.argsort(-s, kind="stable")`
+    # se hamesha THEEK N naam leta hai. Ab live bhi wahi karta hai:
+    # poore number par rank, aur `method="first"` -- tie par pehle wala aage.
+    score_raw = sc.loc[asof].reindex(universe)
+    df["RANK"] = score_raw.where(eligible).rank(ascending=False, method="first")
     df["ELIGIBLE"] = np.where(eligible, "HAAN", "NAHI")
     df = df.sort_values("RANK", na_position="last")
     df["RANK"] = df["RANK"].astype("Float64").round().astype("Int64")
+
+    # AUR AB ISE SAABIT KARO -- maano mat.
+    #
+    # Upar wali bug ka sabse bura roop ye tha ki wo kahin AWAAZ nahi karti
+    # thi: file theek dikhti, bas usme 21 naam par weight hota. Isliye ab
+    # ginti KHUD jaanchi jaati hai. Galat file likhne se behtar hai koi file
+    # na likhna.
+    n_ranked = int(df["RANK"].notna().sum())
+    n_top = int((df["RANK"].notna() & (df["RANK"] <= N_HOLDINGS)).sum())
+    if n_top != min(N_HOLDINGS, n_ranked):
+        raise RuntimeError(
+            f"top-{N_HOLDINGS} me {n_top} naam aa gaye "
+            f"(={min(N_HOLDINGS, n_ranked)} hone chahiye the). "
+            f"RANK me tie hai -- weight galat naamo me bant jaata."
+        )
+    if int(df["RANK"].dropna().duplicated().sum()):
+        raise RuntimeError("RANK me duplicate hai -- ranking ka tie-break toota.")
 
     # WEIGHT -- V2 me paisa barabar nahi, SCORE ke hisaab se bantata hai.
     #
