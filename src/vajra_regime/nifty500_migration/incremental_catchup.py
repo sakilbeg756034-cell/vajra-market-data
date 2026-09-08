@@ -101,10 +101,58 @@ def _refresh_current_snapshot(data_root: Path, *, as_of: date) -> dict[str, Any]
     required = {"Company Name", "Industry", "Symbol", "Series", "ISIN Code"}
     if not required.issubset(frame.columns):
         raise RuntimeError(f"Official constituent schema changed: {sorted(frame.columns)}")
-    if len(frame) != 500 or frame["Symbol"].nunique() != 500 or frame["ISIN Code"].nunique() != 500:
-        raise RuntimeError("Official current Nifty500 snapshot failed exact 500-member identity gate")
+
+    # NSE KE PLACEHOLDER ROW PEHLE NIKALO, PHIR 500 KA GATE LAGAO.
+    #
+    # 7 September 2026 ko NSE ne apni list me ye row daal di:
+    #     Dummy HEG Ltd.,Metals & Mining,DUMMYHEG,EQ,DUM545A01024
+    # Ye asli company nahi hai. Demerger/restructuring ke beech NSE aisa
+    # placeholder banata hai taaki naye kaagaz ke liye jagah bani rahe. Uska
+    # "ISIN" bhi asli nahi hai -- asli Indian ISIN hamesha "IN" se shuru hota
+    # hai, ye "DUM" se shuru hoti hai.
+    #
+    # Nateeja: list me 501 row aa gayin aur neeche wala `!= 500` gate poore
+    # roz ke pipeline ko mar gaya. 8 September ki subah tak do raat ka run
+    # fail ho chuka tha aur published dataset 2026-09-04 par ruka pada tha --
+    # halaanki na data me kuch kharaab tha, na strategy me. Aur ye gate to
+    # NIFTY 500 ka hai, jabki strategy VAJRA 750 par chalti hai.
+    #
+    # Gate DHEELA nahi kiya gaya (koi "495 se 505 ke beech" wala band nahi).
+    # Placeholder ko pehchaan kar alag kiya jaata hai, aur uske BAAD bilkul
+    # wahi sakht 500 ki shart lagti hai. Kitne nikale, wo provenance me likha
+    # jaata hai -- taaki chup-chaap kuch na gire.
+    isin_text = frame["ISIN Code"].astype("string").str.strip().str.upper()
+    symbol_text = frame["Symbol"].astype("string").str.strip().str.upper()
+    is_placeholder = ~isin_text.str.startswith("IN", na=False) | symbol_text.str.startswith(
+        "DUMMY", na=False
+    )
+    placeholders = frame[is_placeholder]
+    members = frame[~is_placeholder]
+
+    if len(members) != 500 or members["Symbol"].nunique() != 500 or members["ISIN Code"].nunique() != 500:
+        raise RuntimeError(
+            "Official current Nifty500 snapshot failed exact 500-member identity gate "
+            f"({len(members)} rows, {members['Symbol'].nunique()} symbols, "
+            f"{members['ISIN Code'].nunique()} ISINs after dropping "
+            f"{len(placeholders)} placeholder row(s))"
+        )
+
+    # `active` par HAMESHA 500 hi row jaati hain. Neeche ke saare consumer
+    # (timeline, name-map, membership discovery, certification, publish) isi
+    # file ko padhte hain, isliye placeholder ko yahin rok dena hi sahi hai --
+    # warna wo poore itihaas me ek jhoothi company ban kar ghusta.
+    #
+    # Jab NSE ki list saaf ho (aam din) to file BYTE-KE-BYTE wahi copy hoti
+    # hai jo utri thi -- pehle jaisa hi. Sirf placeholder milne par ek saaf
+    # ki hui copy banti hai. Utra hua kaccha file `dated` me jyon ka tyon
+    # padha rehta hai, taaki saboot ka silsila na toote.
+    source = dated
+    if not placeholders.empty:
+        source = dated.with_name(f"{dated.stem}_cleaned{dated.suffix}")
+        members.to_csv(source, index=False, lineterminator="\n")
+
     prior_hash = sha256_file(active) if active.exists() else None
-    downloaded_hash = sha256_file(dated)
+    downloaded_hash = sha256_file(source)
     if not active.exists() or prior_hash != downloaded_hash:
         if active.exists():
             preserved = current_dir / "Snapshots" / f"pre_{as_of.isoformat()}_{prior_hash[:12]}.csv"
@@ -112,14 +160,17 @@ def _refresh_current_snapshot(data_root: Path, *, as_of: date) -> dict[str, Any]
             if not preserved.exists():
                 shutil.copy2(active, preserved)
         temporary = active.with_name(f".{active.name}.{uuid4().hex}.partial")
-        shutil.copy2(dated, temporary)
+        shutil.copy2(source, temporary)
         os.replace(temporary, active)
     result = {
         "status": record["status"],
         "source_url": CURRENT_CONSTITUENTS,
         "as_of": as_of.isoformat(),
         "members": 500,
-        "dated_snapshot_path": str(dated),
+        "placeholder_rows_dropped": len(placeholders),
+        "placeholder_symbols": sorted(placeholders["Symbol"].astype(str)),
+        "raw_download_path": str(dated),
+        "dated_snapshot_path": str(source),
         "dated_snapshot_sha256": downloaded_hash,
         "active_snapshot_path": str(active),
         "active_snapshot_sha256": sha256_file(active),

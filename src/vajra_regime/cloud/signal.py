@@ -206,8 +206,22 @@ def universe_metrics(paths: StatePaths) -> pd.DataFrame:
         con.register("adj", frame)
         return con.execute(
             """
-            SELECT Date, ISIN, Symbol, Close, TurnoverINR, Traded, IsFrozenBar,
-                   EngineQuarantined, AdjustedThrough,
+            -- `Series` YAHAN SE KABHI MAT HATANA.
+            --
+            -- 8 September 2026 ko ye kami pakdi gayi. `adjusted_frame` Series
+            -- nikalta tha, par YE SELECT use gira deta tha. Aage `rank_table`
+            -- me ek "purani state file" wala rasta tha jo column na milne par
+            -- chup-chaap sab kuch EQ maan leta tha -- aur wahi har roz chal
+            -- raha tha. Nateeja: BE/BZ ka filter LIVE ME MARA HUA THA.
+            --
+            -- Naapa gaya (2026-09-07 ka published signal): 734 me se 734 naam
+            -- "EQ" likhe the, jabki usi din ke bhavcopy me 248 BE aur 27 BZ
+            -- the. HFCL 3 September ko BE me gaya tha aur signal me RANK 3,
+            -- WEIGHT 6.20% par khada tha -- jabki backtest ka universe
+            -- (`IsEQ`) aise naam ko kabhi nahi leta. Live aur backtest do
+            -- alag strategy chala rahe the, aur kahin koi error nahi aata tha.
+            SELECT Date, ISIN, Symbol, Series, Close, TurnoverINR, Traded,
+                   IsFrozenBar, EngineQuarantined, AdjustedThrough,
                    ROW_NUMBER() OVER (
                        PARTITION BY ISIN ORDER BY Date
                    ) AS RowsInStore,
@@ -445,13 +459,25 @@ def rank_table(paths: StatePaths,
 
     at_asof = frame[frame["Date"] == asof].drop_duplicates("ISIN").set_index("ISIN")
     symbols = at_asof["Symbol"]
-    series_at_asof = (
-        at_asof["Series"].astype("string").str.upper()
-        if "Series" in at_asof.columns
-        # Purani state file me ye column nahi hoga. Us halat me sab EQ maana
-        # jaata hai -- jo sach bhi hai, kyunki tab BE rows aati hi nahi thin.
-        else pd.Series("EQ", index=at_asof.index, dtype="string")
-    )
+    # SERIES YAHAN HONA HI CHAHIYE -- aur na milne par CHILLANA hai.
+    #
+    # Pehle yahan ek chup-chaap fallback tha: column na mile to sab "EQ" maan
+    # lo. Wo fallback purani state file ke liye tha, par asal me wo HAR DIN
+    # chal raha tha, kyunki `universe_metrics` ka SELECT Series ko gira deta
+    # tha. BE/BZ ka poora filter is ek line ki wajah se mara hua tha.
+    #
+    # Purani state file ka intezaam pehle se `adjusted_frame` me hai: wahan
+    # column na ho to `'EQ' AS Series` likha jaata hai. Yaani yahan tak Series
+    # hamesha pahunchti hai. Agar nahi pahunchi to kuch aur toota hai --
+    # aur tab chup rehna hi sabse bada khatra hai.
+    if "Series" not in at_asof.columns:
+        raise RuntimeError(
+            "Series column signal tak nahi pahuncha. BE/BZ ka filter bina "
+            "iske lag hi nahi sakta, aur chup-chaap 'sab EQ' maan lena wahi "
+            "bug hai jo 8-Sep-2026 ko pakdi gayi thi. "
+            "`universe_metrics` ka SELECT dekho."
+        )
+    series_at_asof = at_asof["Series"].astype("string").str.upper()
 
     barred = quarantine(paths, frame, m["Close"], m["Traded"])
     live = member.loc[asof] & m["Traded"].loc[asof] & ~barred.loc[asof]

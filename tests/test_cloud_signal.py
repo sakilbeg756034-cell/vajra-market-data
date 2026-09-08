@@ -138,3 +138,49 @@ def test_new_sessions_append_onto_a_pre_series_state_file(tmp_path: Path) -> Non
     # purani rows ko EQ mila, nayi row apni asli series ke saath aayi
     assert merged.loc[merged["Symbol"] == "AAA", "Series"].eq("EQ").all()
     assert merged.loc[merged["Symbol"] == "BBB", "Series"].eq("BE").all()
+
+
+def test_series_survives_the_universe_metrics_query(tmp_path: Path) -> None:
+    """Series `universe_metrics` se hokar signal tak pahunchni CHAHIYE.
+
+    8 September 2026 ko pakdi gayi bug. `adjusted_frame` Series nikalta tha,
+    par `universe_metrics` ka SELECT use GIRA deta tha -- aur `rank_table` me
+    ek "purani state file" wala rasta tha jo column na milne par chup-chaap
+    sab kuch EQ maan leta tha.
+
+    Nateeja: BE/BZ ka filter LIVE ME MARA HUA THA. Naapa gaya (2026-09-07 ka
+    published signal): 734 me se 734 naam "EQ" likhe the, jabki usi din ke
+    bhavcopy me 248 BE aur 27 BZ the. HFCL 3 September ko BE me jaa chuka tha
+    aur signal me RANK 3, WEIGHT 6.20% par khada tha -- jabki backtest ka
+    universe (`IsEQ`) aisa naam kabhi nahi leta.
+
+    Ye test theek us jagah khada hai jahan column gira tha.
+    """
+    from vajra_regime.cloud.signal import universe_metrics
+
+    paths = StatePaths(tmp_path)
+    paths.prices.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({
+        "Date": [pd.Timestamp("2026-03-25").date()] * 2,
+        "ISIN": ["INE000A01001", "INE000B01001"],
+        "Symbol": ["AAA", "BBB"],
+        "Series": ["EQ", "BE"],
+        "Open": [800.0, 50.0], "High": [800.0, 50.0],
+        "Low": [800.0, 50.0], "Close": [800.0, 50.0],
+        "Volume": [1000, 10], "TurnoverINR": [800_000.0, 500.0],
+        "Traded": [True, True], "IsFrozenBar": [False, False],
+        "AdjustedThrough": [None, None],
+        "EngineQuarantined": [False, False],
+    }).to_parquet(paths.prices, index=False)
+    pd.DataFrame({
+        "EventId": [], "ISIN": [], "Symbol": [], "ExDate": [],
+        "PriceFactor": [], "VolumeFactor": [], "ActionType": [], "ParseStatus": [],
+    }).to_parquet(paths.events, index=False)
+
+    metrics = universe_metrics(paths)
+    assert "Series" in metrics.columns, (
+        "universe_metrics ne Series gira di -- BE/BZ ka filter mar jayega"
+    )
+    by_symbol = metrics.set_index("Symbol")["Series"]
+    assert by_symbol["AAA"] == "EQ"
+    assert by_symbol["BBB"] == "BE"

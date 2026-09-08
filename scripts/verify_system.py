@@ -66,6 +66,18 @@ def warn(name, detail=""):
     print(f"   [CHETAVNI] {name}" + (f"  -- {detail}" if detail else ""), flush=True)
 
 
+def info(name, detail=""):
+    """Sirf batane ke liye -- na PASS, na FAIL, na CHETAVNI.
+
+    Kuch number aise hote hain jinka roz badalna SAHI hai (jaise "aaj tak ka
+    CAGR", jo har naye session par khisakta hai). Unhe PASS/FAIL me daalna do
+    me se ek galti karta hai: ya to jhoothi FAIL roz aati hai, ya gate itna
+    dheela kar diya jaata hai ki wo kuch pakadta hi nahi. Isliye ye teesri
+    kism hai -- dikhta hai, ginti me nahi aata.
+    """
+    print(f"   [JAANKARI] {name}" + (f"  -- {detail}" if detail else ""), flush=True)
+
+
 def head(t):
     print("\n" + "-" * 92)
     print(t)
@@ -166,12 +178,18 @@ def check_consistency():
         return
 
     sig = (ENGINE / "code/src/vajra_regime/cloud/signal.py").read_text(encoding="utf-8")
+    core = (ENGINE / "code/src/vajra_regime/cloud/core.py").read_text(encoding="utf-8")
     gs = (SHEET_DIR / "VajraMomentumScanner.gs").read_text(encoding="utf-8")
 
     def grab(text, pat):
         m = re.search(pat, text, re.M)
         return m.group(1) if m else None
 
+    # 8 September 2026: is list me pehle sirf CHAAR number the (n, exit rank,
+    # vol filter, max weight). Baaki har lever bina milaan ke pada tha --
+    # sabse zaroori `skip`, jo 7-Sep ko hi joda gaya tha aur jiske do jagah
+    # alag hone par koi error nahi aata, bas rank chup-chaap alag ho jaate.
+    # `min_adtv`, `max_frozen`, `max_stale` bhi ab yahin milte hain.
     checks = [
         ("kitne stock (n)", lock["n"],
          grab(sig, r"^N_HOLDINGS\s*=\s*(\d+)"), grab(gs, r"N_HOLDINGS:\s*(\d+)")),
@@ -181,6 +199,14 @@ def check_consistency():
          grab(sig, r"^MAX_VOL_PERCENTILE\s*=\s*([\d.]+)"), None),
         ("max weight", lock["max_weight"],
          grab(sig, r"^MAX_WEIGHT\s*=\s*([\d.]+)"), None),
+        ("skip (kitne session chhode)", lock.get("skip", 0),
+         grab(core, r"^SKIP_SESSIONS\s*=\s*(\d+)"), None),
+        ("ADTV ka farsh", lock["min_adtv"],
+         grab(sig, r"^MIN_ADTV_INR\s*=\s*([\d_.]+)"), None),
+        ("frozen-bar ki hadd", lock["max_frozen"],
+         grab(sig, r"^MAX_FROZEN_RATE\s*=\s*([\d.]+)"), None),
+        ("stale-bhaav ki hadd", lock["max_stale"],
+         grab(sig, r"^MAX_STALE_SESSIONS\s*=\s*(\d+)"), None),
     ]
     for name, want, in_engine, in_sheet in checks:
         parts, bad_any = [f"lock={want}"], False
@@ -193,6 +219,15 @@ def check_consistency():
             parts.append(f"sheet={in_sheet}" + ("" if same else " <-- ALAG"))
             bad_any |= not same
         (bad if bad_any else ok)(name, "  ".join(parts))
+
+    # AGREE ke do lookback -- lock me list hai, code me do alag constant.
+    want_windows = sorted(lock.get("windows", []))
+    got_windows = sorted(
+        int(x) for x in (grab(core, r"^SHORT_LOOKBACK\s*=\s*(\d+)"),
+                         grab(core, r"^LONG_LOOKBACK\s*=\s*(\d+)")) if x
+    )
+    (ok if got_windows == want_windows else bad)(
+        "AGREE ke lookback", f"lock={want_windows}  engine={got_windows}")
 
     for col in ("WEIGHT_PCT", "VOL_RANK_PCT"):
         in_e, in_s = col in sig, col in gs
@@ -236,6 +271,25 @@ def check_consistency():
         f"signal.py={'haan' if live_elig else 'NAHI'}  "
         f"lab.py me purana tareeka={'HAAN (galat)' if old_way else 'nahi'}")
 
+    # BE/BZ ka filter live me SACH ME zinda hai?
+    #
+    # 8 September 2026: `universe_metrics` ka SELECT `Series` gira deta tha,
+    # aur `rank_table` me ek chup-chaap fallback tha jo column na milne par
+    # sab kuch EQ maan leta tha. Nateeja: surveillance filter live me MARA
+    # HUA tha -- 734 me se 734 naam "EQ", jabki us din 248 BE aur 27 BZ the.
+    # HFCL BE me jaa chuka tha aur signal me RANK 3 par khada tha.
+    #
+    # Ye jaanch code ki SHAKAL dekhti hai, output ki nahi -- kyunki kisi din
+    # sach me saare naam EQ ho sakte hain, aur tab output wali jaanch jhoothi
+    # shikayat karti.
+    metrics_has_series = re.search(
+        r"SELECT Date, ISIN, Symbol, Series,", sig) is not None
+    no_silent_eq = 'pd.Series("EQ", index=at_asof.index' not in sig
+    (ok if (metrics_has_series and no_silent_eq) else bad)(
+        "BE/BZ filter live me zinda hai",
+        f"universe_metrics me Series={'haan' if metrics_has_series else 'NAHI'}  "
+        f"chup-chaap EQ maan lena hataya={'haan' if no_silent_eq else 'NAHI'}")
+
 
 # ==================================================================== 4
 def check_live():
@@ -249,16 +303,53 @@ def check_live():
     for col in ("WEIGHT_PCT", "VOL_RANK_PCT", "RANK", "SCORE", "ELIGIBLE"):
         (ok if col in header else bad)(f"CSV me {col}")
 
+    # CLOUD KA STATUS SEEDHE CLOUD SE PADHO -- local clone se NAHI.
+    #
+    # 8 September 2026 ko ye kami pakdi gayi. Is hisse ka title tha "cloud par
+    # jo file hai wahi", par ye `D:\google sheet maintenance file\vajra-signals`
+    # ki LOCAL COPY padhta tha. Wo copy tabhi taaza hoti hai jab koi haath se
+    # `git pull` kare. Yaani ye jaanch cloud ki sehat naapti hi nahi thi -- wo
+    # sirf ye bataati thi ki aapne aakhri baar kab pull kiya tha.
+    #
+    # Us din ye "live signal taaza -- 2026-09-04 (4 din)" chhaap raha tha,
+    # jabki cloud par 2026-09-07 ka signal pada tha. Agar cloud sach me mar
+    # jaata, to ye jaanch usi tarah chup rehti.
+    #
+    # Repo public hai, isliye koi token nahi chahiye. Internet na ho to ye
+    # CHETAVNI deti hai aur local copy par lautti hai -- par tab saaf likha
+    # jaata hai ki number local copy ka hai, cloud ka nahi.
+    cloud_st, source = None, "local copy"
     try:
-        st = json.loads(status.read_text(encoding="utf-8"))
+        import urllib.request                                     # noqa: PLC0415
+        url = ("https://raw.githubusercontent.com/sakilbeg756034-cell/"
+               "vajra-signals/main/out/status.json")
+        with urllib.request.urlopen(url, timeout=25) as resp:      # noqa: S310
+            cloud_st = json.loads(resp.read().decode("utf-8"))
+        source = "cloud"
+    except Exception as exc:                                          # noqa: BLE001
+        warn("cloud se status.json nahi mila",
+             f"{str(exc)[:70]} -- neeche ke number LOCAL COPY ke hain")
+
+    try:
+        local_st = json.loads(status.read_text(encoding="utf-8"))
+        st = cloud_st if cloud_st is not None else local_st
         ok("status.json", f"n_holdings={st['n_holdings']}  "
                           f"exit_rank={st['exit_rank']}  "
                           f"eligible={st['eligible']}/{st['universe_rows']}")
         last = date.fromisoformat(st["as_of_session"])
         age = (date.today() - last).days
-        (ok if age <= 4 else warn)(
-            "live signal taaza", f"{last} ({age} din)"
+        (ok if age <= 4 else bad)(
+            f"live signal taaza ({source})", f"{last} ({age} din)"
             + ("" if age <= 4 else " -- GitHub Actions dekho"))
+        if cloud_st is not None:
+            lag = (date.fromisoformat(cloud_st["as_of_session"])
+                   - date.fromisoformat(local_st["as_of_session"])).days
+            (ok if lag == 0 else warn)(
+                "local clone cloud ke barabar hai",
+                f"local {local_st['as_of_session']}  cloud "
+                f"{cloud_st['as_of_session']}"
+                + ("" if lag == 0 else "  -- `git pull` chalao, warna "
+                                       "reconcile.py purani file se milaayega"))
         if st["eligible"] >= st["universe_rows"]:
             bad("vol filter live me lag hi nahi raha",
                 f"eligible {st['eligible']} == universe {st['universe_rows']}")
@@ -273,8 +364,19 @@ def check_live():
 def check_engine_tests():
     head("5. ENGINE KE APNE TEST")
     try:
-        p = subprocess.run([str(PYTHON), "-m", "pytest", "tests/", "-q",
-                            "--no-header"],
+        # `-o addopts=""` ZAROORI hai.
+        #
+        # pyproject.toml me `addopts = "-q --disable-warnings --maxfail=1"` hai.
+        # Use aise hi chhodne par do nuksaan hote the:
+        #   * `--maxfail=1` pehli failure par ruk jaata tha -- yaani "kitne
+        #     test toote" ka jawab kabhi nahi milta tha
+        #   * addopts ka `-q` aur yahan ka `-q` mil kar DOUBLE-QUIET ban jaate
+        #     the, aur us halat me pytest aakhri summary line ("156 passed")
+        #     chhaapta hi nahi. Nateeja: is jaanch ka saboot sirf dots tha.
+        # START_HERE_AI.md hissa 5 khud kehta hai ki addopts hataana zaroori
+        # hai; ye file usi apne niyam ko nahi maan rahi thi.
+        p = subprocess.run([str(PYTHON), "-m", "pytest", "tests/",
+                            "-o", "addopts=", "-q", "--no-header"],
                            cwd=str(ENGINE / "code"), capture_output=True,
                            text=True, encoding="utf-8", errors="replace",
                            timeout=1800)
@@ -300,12 +402,23 @@ def check_schedule():
         out = (p.stdout or "").strip()
         if "|" in out:
             state, code, when = out.split("|")
-            if state.lower() == "ready" and code.strip() == "0":
-                ok("scheduled task", f"{state}, aakhri run {when}, natija OK")
-            elif state.lower() == "disabled":
+            code = code.strip()
+            if state.lower() == "disabled":
                 bad("scheduled task BAND hai", f"{state} -- data taaza nahi hoga")
+            elif code == "267009":          # Windows: "task abhi chal raha hai"
+                ok("scheduled task", f"{state}, abhi chal raha hai ({when})")
+            elif code == "0":
+                ok("scheduled task", f"{state}, aakhri run {when}, natija OK")
             else:
-                warn("scheduled task", f"{state}, natija code {code}, {when}")
+                # PEHLE YE SIRF CHETAVNI THI -- aur wo galat tha.
+                # 8 September 2026: do raat se roz ka run fail ho raha tha
+                # (NSE ki list me DUMMYHEG aa gaya tha) aur ye script phir bhi
+                # "0 FAIL" chhaap rahi thi. Jis script ka kaam hi ye saabit
+                # karna hai ki system theek hai, wo tootay hue pipeline par
+                # chup nahi reh sakti.
+                bad("roz ka task FAIL hua",
+                    f"{state}, natija code {code}, {when} -- "
+                    f"logs\\daily\\ ka aakhri log padho")
         else:
             bad("scheduled task nahi mila", (p.stderr or "")[:80])
     except Exception as exc:                                          # noqa: BLE001
@@ -315,8 +428,43 @@ def check_schedule():
     if st.exists():
         try:
             d = json.loads(st.read_text(encoding="utf-8"))
-            (ok if d.get("status") == "SUCCESS" else warn)(
-                "aakhri engine run", f"{d.get('status')}  {d.get('generated_at_local')}")
+            s = d.get("status")
+            when = d.get("generated_at_local")
+            # RUNNING ka matlab do me se ek hai:
+            #   * run ABHI chal raha hai (waqt taaza hai) -- theek hai
+            #   * run beech me MAR gaya (waqt purana hai) -- ye dekhna zaroori
+            # 7-Sep-2026 ko yahi hua tha: 18:10 ka run poora kaam kar chuka tha
+            # (dataset publish bhi ho gaya), par process maara gaya aur status
+            # file me 13:46 wale purane run ka SUCCESS pada raha. Ab shuru me
+            # hi RUNNING likha jaata hai, isliye aisa run chhupta nahi.
+            #
+            # FAILED ab CHETAVNI nahi, FAIL hai. Wajah upar scheduled task
+            # wale note me likhi hai: tootay hue pipeline par "0 FAIL"
+            # chhaapna hi sabse bada khatra hai.
+            age_min = None
+            try:
+                age_min = (datetime.now() - datetime.fromisoformat(str(when))
+                           ).total_seconds() / 60.0
+            except Exception:                                         # noqa: BLE001
+                pass
+            if s == "SUCCESS":
+                ok("aakhri engine run", f"{s}  {when}")
+            elif s == "FAILED":
+                bad("aakhri engine run FAIL hua",
+                    f"{when} -- {str(d.get('message'))[:70]}")
+            elif s == "RUNNING" and age_min is not None and age_min <= 60:
+                # 60 minute se kam purana RUNNING = sach me chal raha hai.
+                # Poora run ~13 minute leta hai, isliye 60 udaar hadd hai.
+                ok("aakhri engine run", f"{s} (abhi chal raha hai)  {when}")
+            elif s == "RUNNING":
+                # Purana RUNNING = run beech me MAR gaya. 7-Sep-2026 ko yahi
+                # hua tha: 18:10 ka run poora kaam kar chuka tha, par process
+                # maara gaya aur status file me purana SUCCESS pada raha.
+                bad("engine run beech me MAR gaya",
+                    f"{s} likha hai par {when} ka hai -- itna purana RUNNING "
+                    f"ka matlab process khatam ho gaya tha")
+            else:
+                warn("aakhri engine run", f"{s}  {when}")
         except Exception as exc:                                      # noqa: BLE001
             warn("run status padha nahi gaya", str(exc)[:90])
 
@@ -358,8 +506,22 @@ cfg = lab.make_cfg(s, 'verify')
 assert cfg.max_vol_pct is not None, 'max_vol_pct cfg me nahi pohoncha'
 nav = F.run(P, sc, cfg, vol=vol, extra_filter=f,
             apply_costs=True, apply_tax=False).nav
-print(f'{M.cagr(nav)*100:.2f}|{M.max_dd(nav)*100:.1f}|'
-      f'{m["Close"].shape[0]}|{m["Close"].shape[1]}')
+# NAV ko USI DIN par kaato jis din tak ka data lock file ne dekha tha.
+#
+# Lock ek DAAWA hai: "is config par, is dataset par (2026-09-04 tak), CAGR
+# 33.36% aata hai." Us daawe ko dobara jaanchne ke liye WAHI window chahiye.
+# Bina kaate, dataset ke har naye session par number apne aap khisak jaata
+# hai aur ye jaanch ROZ jhoothi FAIL deti -- 8-Sep-2026 ko theek yahi hua
+# (33.54% aaya, jabki 04-Sep par kaatne se bilkul 33.36% mila).
+# Aur roz jhoothi shikayat karne wale gate ko log dekhna chhod dete hain.
+import pandas as pd
+lock_last = pd.Timestamp(json.loads(
+    Path(r'D:\VAJRA_RESEARCH\work\results\LOCKED_STRATEGY_V2.json')
+    .read_text(encoding='utf-8'))['dataset_last_session'])
+frozen = nav[nav.index <= lock_last]
+print(f'{M.cagr(frozen)*100:.2f}|{M.max_dd(frozen)*100:.1f}|'
+      f'{m["Close"].shape[0]}|{m["Close"].shape[1]}|'
+      f'{frozen.index[-1].date()}|{M.cagr(nav)*100:.2f}|{nav.index[-1].date()}')
 """
 
 
@@ -381,15 +543,32 @@ def check_strategy_reproduces():
         if not line:
             bad("backtest chala nahi", (p.stderr or "")[-250:])
             return
-        cagr, dd, sess, names = line[-1].split("|")
+        cagr, dd, sess, names, cut_on, live_cagr, live_on = line[-1].split("|")
         cagr, dd = float(cagr), float(dd)
         ok("panel", f"{sess} session x {names} naam")
-        if abs(cagr - want_cagr) < 0.05 and abs(dd - want_dd) < 0.2:
+
+        lock_last = str(json.loads(LOCK.read_text(encoding="utf-8"))
+                        ["dataset_last_session"])[:10]
+        if cut_on != lock_last:
+            # Lock 2026-09-04 tak ka daawa karta hai par panel usse pehle hi
+            # khatam ho gaya -- yaani daawa dobara jaanchna mumkin hi nahi.
+            warn("lock ka daawa jaancha nahi ja saka",
+                 f"lock {lock_last} tak ka hai, panel sirf {cut_on} tak jaata hai")
+        elif abs(cagr - want_cagr) < 0.05 and abs(dd - want_dd) < 0.2:
             ok("locked strategy wahi jawab deti hai",
-               f"CAGR {cagr}% ({want_cagr} chahiye), MaxDD {dd}% ({want_dd} chahiye)")
+               f"{cut_on} tak: CAGR {cagr}% ({want_cagr} chahiye), "
+               f"MaxDD {dd}% ({want_dd} chahiye)")
         else:
             bad("NUMBER BADAL GAYA",
-                f"CAGR {cagr}% ({want_cagr} chahiye), MaxDD {dd}% ({want_dd} chahiye)")
+                f"{cut_on} tak: CAGR {cagr}% ({want_cagr} chahiye), "
+                f"MaxDD {dd}% ({want_dd} chahiye)")
+
+        # Aaj tak ka number sirf JAANKARI hai -- ispar koi gate nahi.
+        # Dataset roz aage badhta hai, isliye ye roz thoda badlega. Ye
+        # normal hai; jo cheez badalni NAHI chahiye wo upar wali line hai.
+        info("aaj tak ka number (gate nahi)",
+             f"{live_on} tak: CAGR {live_cagr}%  "
+             f"(lock ke din {cut_on} par {cagr}% tha)")
     except Exception as exc:                                          # noqa: BLE001
         bad("backtest fail", str(exc)[:150])
 

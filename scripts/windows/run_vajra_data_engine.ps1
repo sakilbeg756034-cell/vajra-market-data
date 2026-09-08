@@ -55,6 +55,23 @@ function Write-Status {
 }
 
 Start-Transcript -Path $LogPath -Force | Out-Null
+
+# SABSE PEHLE "CHAL RAHA HAI" LIKH DO.
+#
+# 7 September 2026 ko ye kami pakdi gayi. Us din 18:10 ka run poora kaam kar
+# chuka tha (dataset 18:23 par publish bhi ho gaya), par uske turant baad
+# process MAARA GAYA -- Task Scheduler ne 1067 diya, "The process terminated
+# unexpectedly". Nateeja: `latest_engine_run.json` me 13:46 wale PURANE run ka
+# "SUCCESS" pada raha.
+#
+# Yaani agar koi us file se poochta "aaj ka run theek gaya?", to jawab milta
+# "haan" -- jabki aakhri run mara ja chuka tha. Ek chup-chaap jhoot.
+#
+# Ab run ke SHURU me hi "RUNNING" likh diya jaata hai. Run poora hone par wo
+# SUCCESS ya FAILED se badal jaata hai. Agar file me RUNNING pada mile aur
+# uska waqt purana ho, to saaf hai ki wo run beech me mar gaya tha.
+Write-Status -Status "RUNNING" -Message "Run shuru hua. Poora hone par ye line badal jaayegi." -ExitCode -1
+
 try {
     Push-Location $RepoRoot
     try {
