@@ -412,9 +412,38 @@ def quarantine(paths: StatePaths, frame: pd.DataFrame, close: pd.DataFrame,
     if len(known):
         known = known.assign(ISIN=_canon_series(paths, known["ISIN"]))
 
-    flagged = (frame.pivot(index="Date", columns="ISIN", values="EngineQuarantined")
-               .reindex(index=close.index, columns=close.columns)
-               .fillna(False).astype(bool))
+    # ENGINE KA FAISLA US DIN KA HAI -- SAAL BHAR KA NAHI.
+    #
+    # 8-Sep-2026 ko pakdi gayi. Neeche `flagged` par 252-session ka blackout
+    # lagta hai (aakhri line). Wo blackout SAHI hai un jhatkon ke liye jinhe
+    # koi corporate action nahi samjhata -- aisa break poore saal R12 ko
+    # zeher kar deta hai. Par wo `EngineQuarantined` par lagana GALAT tha.
+    #
+    # `EngineQuarantined` = CorporateActionQuarantineFlag OR NOT
+    # IsResearchEligible -- yaani "engine ne is din ko REVIEW me rakha".
+    # Naapa gaya (VAJRA_DATA, 2025-09 se): aise 45 alag reason the aur unme
+    # se EK BHI unexplained break nahi tha -- sab "REVIEW_NEEDED: Rights ...",
+    # "Demerger", "BONUS_GAIR_EQUITY" -- aur har ek theek 3 DIN ka. Engine
+    # unhe suljha kar bhaav theek kar deta hai; uske baad series saaf hai,
+    # zeher kuch nahi bacha.
+    #
+    # Us 3-din wale flag par saal bhar ka blackout lagane se kya hua:
+    #   aaj bandh naam            : 57
+    #   inme se laptop ke universe me: 15 -- ADANIENT, HINDUNILVR, VEDL,
+    #                               RATNAVEER (laptop par RANK 50, yaani
+    #                               trade ke dayre me) aur 11 aur
+    #   HINDUNILVR aakhri baar flag hua tha 273 DIN pehle
+    #
+    # Laptop yahi kaam theek karta hai: `IsResearchEligible` US DIN ka lagta
+    # hai, aur 252-din ka blackout SIRF `UnexplainedBreak` par
+    # (`data.unexplained_blackout`). Ab cloud bhi wahi karta hai --
+    # engine ka faisla us din ka, aur blackout sirf un teen niyamo par jo
+    # cloud KHUD pakadta hai (jo apni paribhasha se hi "samajh nahi aaya"
+    # wale hain).
+    engine_din_ka = (frame.pivot(index="Date", columns="ISIN", values="EngineQuarantined")
+                     .reindex(index=close.index, columns=close.columns)
+                     .fillna(False).astype(bool))
+    flagged = pd.DataFrame(False, index=close.index, columns=close.columns)
 
     # 1. Anupaat-heen corporate action -- sirf bootstrap ke baad wale.
     for isin, ex in zip(unratioed["ISIN"], unratioed["ExDate"], strict=False):
@@ -452,7 +481,9 @@ def quarantine(paths: StatePaths, frame: pd.DataFrame, close: pd.DataFrame,
                 if not any(abs(e - d) <= window for e in by_isin.get(isin, ())):
                     flagged.loc[d, isin] = True
 
-    return flagged.rolling(LOOKBACK_BLACKOUT, min_periods=1).max().astype(bool)
+    # Blackout SIRF cloud ke apne teen niyamo par. Engine ka faisla us din ka.
+    blackout = flagged.rolling(LOOKBACK_BLACKOUT, min_periods=1).max().astype(bool)
+    return (engine_din_ka | blackout).astype(bool)
 
 
 def _canon_series(paths: StatePaths, isins: pd.Series) -> pd.Series:

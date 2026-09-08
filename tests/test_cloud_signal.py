@@ -245,3 +245,57 @@ def test_isin_badalne_par_series_nahi_tootti(tmp_path: Path) -> None:
     assert list(saath.sort_values("Date")["SourceISIN"]) == ["INE000A01001", "INE000A01019"]
     # ek din par ek hi row -- warna pivot phat jaata hai
     assert not saath.duplicated(subset=["Date", "ISIN"]).any()
+
+
+def test_engine_quarantine_saal_bhar_nahi_chalta(tmp_path: Path) -> None:
+    """Engine ka quarantine US DIN ka hai -- saal bhar ka nahi.
+
+    8 September 2026 ko pakdi gayi. `quarantine()` ke aakhir me 252-session ka
+    blackout lagta hai. Wo blackout un jhatkon ke liye SAHI hai jinhe koi
+    corporate action nahi samjhata -- aisa break poore saal R12 ko zeher kar
+    deta hai. Par wo `EngineQuarantined` par bhi lag raha tha, aur wo GALAT
+    tha.
+
+    `EngineQuarantined` ka matlab hai "engine ne is din ko review me rakha".
+    Naapa gaya (VAJRA_DATA, 2025-09 se): aise 45 alag reason the aur unme se
+    EK BHI unexplained break nahi tha -- sab "REVIEW_NEEDED: Rights ...",
+    "Demerger", "BONUS_GAIR_EQUITY" -- aur har ek theek 3 DIN ka.
+
+    Nateeja: aaj 57 naam bandh the, jinme se 15 laptop ke universe me the --
+    ADANIENT, HINDUNILVR, VEDL, aur RATNAVEER jo laptop par RANK 50 par tha,
+    yaani trade ke dayre me. HINDUNILVR aakhri baar 273 DIN pehle flag hua tha.
+
+    Sudhaar ke baad reconcile me rank ka farq 3 se 1 par aa gaya.
+    """
+    from vajra_regime.cloud.signal import matrices, quarantine, universe_metrics
+
+    paths = StatePaths(tmp_path)
+    paths.prices.parent.mkdir(parents=True, exist_ok=True)
+    din = pd.bdate_range("2026-01-01", periods=40)
+    rows = []
+    for i, d in enumerate(din):
+        rows.append({
+            "Date": d.date(), "ISIN": "INE000A01001", "Symbol": "AAA", "Series": "EQ",
+            "Open": 100.0, "High": 100.0, "Low": 100.0, "Close": 100.0 + i,
+            "Volume": 10, "TurnoverINR": 1000.0, "Traded": True, "IsFrozenBar": False,
+            "AdjustedThrough": din[-1].date(),
+            # engine ne sirf 3 din review me rakha tha, phir suljha diya
+            "EngineQuarantined": i in (5, 6, 7),
+        })
+    pd.DataFrame(rows).to_parquet(paths.prices, index=False)
+    pd.DataFrame({
+        "EventId": [], "ISIN": [], "Symbol": [], "ExDate": [],
+        "PriceFactor": [], "VolumeFactor": [], "ActionType": [], "ParseStatus": [],
+    }).to_parquet(paths.events, index=False)
+
+    frame = universe_metrics(paths)
+    m = matrices(frame)
+    barred = quarantine(paths, frame, m["Close"], m["Traded"])
+
+    flagged_din = [m["Close"].index[i] for i in (5, 6, 7)]
+    assert barred.loc[flagged_din].to_numpy().all(), "un teen dino par to bandh hona hi chahiye"
+    baad = m["Close"].index[8:]
+    assert not barred.loc[baad].to_numpy().any(), (
+        "engine ne suljha diya tha; uske BAAD naam bandh nahi rehna chahiye. "
+        "252-session ka blackout sirf un niyamo par lagta hai jo cloud khud pakadta hai."
+    )
