@@ -116,11 +116,55 @@ OUTPUT_COLUMNS = [
 ]
 
 
+def isin_lineage(paths: StatePaths) -> pd.DataFrame:
+    """SourceISIN -> CanonicalISIN. File na ho to khaali (purana behaviour).
+
+    Ye jaan-boojh kar ek CHHOTI file hai aur store se ALAG hai: store me har
+    row NSE ke apne ISIN ke saath padi rehti hai (wahi sach hai jo NSE ne us
+    din kaha), aur naksha sirf PADHTE waqt lagta hai. Isse store kabhi jhootha
+    nahi hota, aur naksha badalne par purana data dobara likhna nahi padta.
+    """
+    if not paths.isin_lineage.exists():
+        return pd.DataFrame(columns=["SourceISIN", "CanonicalISIN"])
+    frame = pd.read_parquet(paths.isin_lineage)
+    return frame.dropna().drop_duplicates("SourceISIN")
+
+
 def adjusted_frame(paths: StatePaths) -> pd.DataFrame:
-    """Har row ka point-in-time adjusted close."""
+    """Har row ka point-in-time adjusted close, company ke sthir ISIN par."""
     prices = paths.prices.as_posix()
     events = paths.events.as_posix()
+    lineage = isin_lineage(paths)
     with duckdb.connect() as con:
+        # ISIN KO COMPANY KE STHIR ID PAR LE AAO -- 8 September 2026.
+        #
+        # NSE face value badalne par naya ISIN de deta hai. Cloud ke liye wo
+        # bilkul naya security ban jaata tha, isliye ek hi company ki series
+        # do tukdo me pad jaati thi. Naapa gaya: 500-session store me 31 symbol
+        # aise the. Nateeja do tarah ka nuksaan:
+        #   * naya tukda 252-session wali shart par fail -> naam ~1 saal ke
+        #     liye sheet se GAYAB (TDPOWERSYS, jo laptop ke backtest me rank 11
+        #     par tha -- yaani kharidne wala naam)
+        #   * jo bacha rehta uska R12 aadhi series par banta (V2RETAIL ka SCORE
+        #     0.403 se alag tha, jo sabse bada farq tha)
+        #
+        # Naksha DONO taraf lagta hai -- bhaav par bhi aur corporate action par
+        # bhi -- kyunki dono company ke hain, ISIN ke nahi. Adjustment phir bhi
+        # `AdjustedThrough` se bandha rehta hai, isliye bootstrap rows par kuch
+        # dobara nahi lagta.
+        con.register("lineage", lineage)
+        # CAST zaroori hai: khaali event file me ISIN ka type DOUBLE aa jaata
+        # hai (koi row hi nahi hoti), aur DuckDB VARCHAR ke saath COALESCE
+        # karne se mana kar deta hai. Ye asli store me kabhi nahi hota, par
+        # ek naye/khaali store par script fatne ke bajay chalni chahiye.
+        canon_p = ("COALESCE(lp.CanonicalISIN, CAST(p.ISIN AS VARCHAR))"
+                   if len(lineage) else "CAST(p.ISIN AS VARCHAR)")
+        canon_e = ("COALESCE(le.CanonicalISIN, CAST(ev.ISIN AS VARCHAR))"
+                   if len(lineage) else "CAST(ev.ISIN AS VARCHAR)")
+        join_p = ("LEFT JOIN lineage lp ON lp.SourceISIN = CAST(p.ISIN AS VARCHAR)"
+                  if len(lineage) else "")
+        join_e = ("LEFT JOIN lineage le ON le.SourceISIN = CAST(ev.ISIN AS VARCHAR)"
+                  if len(lineage) else "")
         # Series column naya hai. Jo state file usse pehle bani thi usme wo nahi
         # hoga -- aur wahan 'EQ' likhna sach hai, kyunki tab intake BE/BZ leta
         # hi nahi tha. Isse purani state bina dobara bootstrap kiye chalti rehti
@@ -134,12 +178,31 @@ def adjusted_frame(paths: StatePaths) -> pd.DataFrame:
         return con.execute(
             f"""
             WITH ev AS (
-                SELECT ISIN, CAST(ExDate AS DATE) AS ExDate, PriceFactor
-                FROM read_parquet('{events}')
-                WHERE PriceFactor IS NOT NULL AND PriceFactor <> 1.0
-                  AND ExDate IS NOT NULL
+                SELECT {canon_e} AS ISIN, CAST(ev.ExDate AS DATE) AS ExDate,
+                       ev.PriceFactor
+                FROM read_parquet('{events}') ev
+                {join_e}
+                WHERE ev.PriceFactor IS NOT NULL AND ev.PriceFactor <> 1.0
+                  AND ev.ExDate IS NOT NULL
             ),
-            p AS (SELECT * FROM read_parquet('{prices}')),
+            praw AS (
+                SELECT p.* REPLACE ({canon_p} AS ISIN),
+                       p.ISIN AS SourceISIN
+                FROM read_parquet('{prices}') p
+                {join_p}
+            ),
+            -- Do source-ISIN ek hi din par ek hi company ke ho jaayein to ek
+            -- hi row rakhni hai (warna pivot phat jaata hai). Aisa hona nahi
+            -- chahiye -- naapa gaya: 0 baar -- par chup-chaap tootne se behtar
+            -- hai ki niyam likha ho: jo sach me trade hua aur jiska turnover
+            -- zyada tha, wahi rakha jaata hai.
+            p AS (
+                SELECT * FROM praw
+                QUALIFY row_number() OVER (
+                    PARTITION BY Date, ISIN
+                    ORDER BY Traded DESC, TurnoverINR DESC NULLS LAST, SourceISIN
+                ) = 1
+            ),
             f AS (
                 SELECT p.Date AS d, p.ISIN AS i,
                        coalesce(exp(sum(ln(ev.PriceFactor))), 1.0) AS Factor
@@ -164,7 +227,11 @@ def adjusted_frame(paths: StatePaths) -> pd.DataFrame:
                    p.Close * p.Volume            AS TurnoverINR,
                    {series_expr},
                    p.Traded, p.IsFrozenBar,
-                   p.EngineQuarantined, p.AdjustedThrough
+                   p.EngineQuarantined, p.AdjustedThrough,
+                   -- NSE us din is company ko kis ISIN se bulata tha. Sheet
+                   -- aur reconcile me YAHI dikhna chahiye -- aaj ka asli ISIN,
+                   -- company ka andar wala sthir id nahi.
+                   p.SourceISIN
             FROM p JOIN f ON f.d = p.Date AND f.i = p.ISIN
             ORDER BY p.Date, p.ISIN
             """
@@ -220,8 +287,8 @@ def universe_metrics(paths: StatePaths) -> pd.DataFrame:
             -- WEIGHT 6.20% par khada tha -- jabki backtest ka universe
             -- (`IsEQ`) aise naam ko kabhi nahi leta. Live aur backtest do
             -- alag strategy chala rahe the, aur kahin koi error nahi aata tha.
-            SELECT Date, ISIN, Symbol, Series, Close, TurnoverINR, Traded,
-                   IsFrozenBar, EngineQuarantined, AdjustedThrough,
+            SELECT Date, ISIN, SourceISIN, Symbol, Series, Close, TurnoverINR,
+                   Traded, IsFrozenBar, EngineQuarantined, AdjustedThrough,
                    ROW_NUMBER() OVER (
                        PARTITION BY ISIN ORDER BY Date
                    ) AS RowsInStore,
@@ -335,6 +402,16 @@ def quarantine(paths: StatePaths, frame: pd.DataFrame, close: pd.DataFrame,
             f"FROM read_parquet('{events_path}') WHERE ExDate IS NOT NULL"
         ).df()
 
+    # Event NSE ke ISIN par aate hain, par neeche `flagged` ke column company ke
+    # STHIR id par hain. Bina mel ke jis naam ka ISIN badla ho uska quarantine
+    # chup-chaap LAGTA HI NAHI -- aur ye udaar disha hai (cloud aisa naam
+    # kharidne ko keh deta jise engine ne rok rakha hai). Isliye dono taraf
+    # ek hi id par laaya jaata hai.
+    if len(unratioed):
+        unratioed = unratioed.assign(ISIN=_canon_series(paths, unratioed["ISIN"]))
+    if len(known):
+        known = known.assign(ISIN=_canon_series(paths, known["ISIN"]))
+
     flagged = (frame.pivot(index="Date", columns="ISIN", values="EngineQuarantined")
                .reindex(index=close.index, columns=close.columns)
                .fillna(False).astype(bool))
@@ -378,12 +455,29 @@ def quarantine(paths: StatePaths, frame: pd.DataFrame, close: pd.DataFrame,
     return flagged.rolling(LOOKBACK_BLACKOUT, min_periods=1).max().astype(bool)
 
 
+def _canon_series(paths: StatePaths, isins: pd.Series) -> pd.Series:
+    """Kisi bhi ISIN ki list ko company ke sthir id par le aao."""
+    lin = isin_lineage(paths)
+    if not len(lin):
+        return isins
+    naksha = dict(zip(lin["SourceISIN"].astype(str), lin["CanonicalISIN"].astype(str)))
+    return isins.astype(str).map(lambda v: naksha.get(v, v))
+
+
 def _reference(paths: StatePaths, universe) -> tuple[pd.Series, pd.Series]:
-    """ISIN se company naam aur sector. Na mile to khaali -- andaaza nahi."""
+    """ISIN se company naam aur sector. Na mile to khaali -- andaaza nahi.
+
+    `reference_names.parquet` roz ke run se banti hai aur usme NSE ka apna ISIN
+    hota hai, jabki `universe` company ke STHIR id par hai. Isliye lookup se
+    pehle dono ko ek hi id par laaya jaata hai -- warna jis naam ka ISIN badla
+    ho uska company-naam aur sector chup-chaap khaali ho jaata.
+    """
     empty = pd.Series("", index=universe)
     if not paths.reference.exists():
         return empty, empty.copy()
-    ref = pd.read_parquet(paths.reference).drop_duplicates("ISIN").set_index("ISIN")
+    ref = pd.read_parquet(paths.reference)
+    ref = ref.assign(ISIN=_canon_series(paths, ref["ISIN"]))
+    ref = ref.drop_duplicates("ISIN").set_index("ISIN")
     return (ref["NAME"].reindex(universe).fillna(""),
             ref["SECTOR"].reindex(universe).fillna(""))
 
@@ -420,7 +514,15 @@ def _all_time_high(paths: StatePaths, frame: pd.DataFrame,
             """
         ).df().set_index("ISIN")["Factor"] if pd.notna(boundary) else pd.Series(dtype=float)
 
-    seed = pd.read_parquet(paths.ath_seed).drop_duplicates("ISIN").set_index("ISIN")
+    # Dono taraf company ke sthir id par -- ATH seed VAJRA_DATA se aati hai aur
+    # event calendar NSE ke ISIN par, jabki `universe` sthir id par hai. Bina
+    # is mel ke jis naam ka ISIN badla ho uska ATH chup-chaap khaali ho jaata.
+    seed = pd.read_parquet(paths.ath_seed)
+    seed = seed.assign(ISIN=_canon_series(paths, seed["ISIN"]))
+    seed = seed.drop_duplicates("ISIN").set_index("ISIN")
+    if len(factors):
+        factors = factors.groupby(_canon_series(paths, pd.Series(factors.index))
+                                  .values).prod()
     scale = factors.reindex(universe).fillna(1.0)
     seed_high = seed["AthClose"].reindex(universe) * scale
     seed_when = pd.to_datetime(seed["AthDate"].reindex(universe))
@@ -491,7 +593,12 @@ def rank_table(paths: StatePaths,
         "SYMBOL": symbols.reindex(universe),
         "NAME": names,
         "SECTOR": sectors,
-        "ISIN": universe,
+        # ISIN me NSE ka AAJ ka ISIN jaata hai, company ka andar wala sthir id
+        # nahi. Andar hum sthir id par jodte hain (taaki ISIN badalne par series
+        # na toote), par bahar wahi dikhna chahiye jo NSE aaj bolta hai --
+        # sheet me bhi aur reconcile ke join me bhi.
+        "ISIN": (at_asof["SourceISIN"].reindex(universe)
+                 if "SourceISIN" in at_asof.columns else pd.Series(universe, index=universe)),
         "SERIES": series_at_asof.reindex(universe).fillna("EQ"),
         "CLOSE": m["Close"].loc[asof].reindex(universe).round(2),
         "SCORE": sc.loc[asof].reindex(universe).round(4),

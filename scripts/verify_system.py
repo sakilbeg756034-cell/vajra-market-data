@@ -282,13 +282,24 @@ def check_consistency():
     # Ye jaanch code ki SHAKAL dekhti hai, output ki nahi -- kyunki kisi din
     # sach me saare naam EQ ho sakte hain, aur tab output wali jaanch jhoothi
     # shikayat karti.
-    metrics_has_series = re.search(
-        r"SELECT Date, ISIN, Symbol, Series,", sig) is not None
+    # Column ka kram badal sakta hai (8-Sep ko SourceISIN juda tha), isliye
+    # jaanch `universe_metrics` ke SELECT me "Series" DHOONDHTI hai, poori line
+    # se milaati nahi -- warna ye jaanch har chhote badlav par jhooth bolti.
+    sel = re.search(r"SELECT\s+Date,\s*ISIN(.*?)FROM adj", sig, re.S)
+    metrics_has_series = bool(sel) and "Series" in sel.group(1)
     no_silent_eq = 'pd.Series("EQ", index=at_asof.index' not in sig
     (ok if (metrics_has_series and no_silent_eq) else bad)(
         "BE/BZ filter live me zinda hai",
         f"universe_metrics me Series={'haan' if metrics_has_series else 'NAHI'}  "
         f"chup-chaap EQ maan lena hataya={'haan' if no_silent_eq else 'NAHI'}")
+
+    # ISIN badalne par series toot to nahi rahi? (8-Sep-2026 ka sudhaar)
+    has_lineage = "isin_lineage" in sig and "CanonicalISIN" in sig
+    st_py = (ENGINE / "code/src/vajra_regime/cloud/state.py").read_text(encoding="utf-8")
+    (ok if (has_lineage and "isin_lineage" in st_py) else bad)(
+        "ISIN badalne par series judi rehti hai",
+        f"signal.py me naksha={'haan' if has_lineage else 'NAHI'}  "
+        f"state.py me file={'haan' if 'isin_lineage' in st_py else 'NAHI'}")
 
 
 # ==================================================================== 4

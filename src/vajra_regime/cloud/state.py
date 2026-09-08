@@ -73,6 +73,28 @@ class StatePaths:
     def ath_seed(self) -> Path:
         return self.root / "state" / "ath_seed.parquet"
 
+    @property
+    def isin_lineage(self) -> Path:
+        """NSE ka aaj ka ISIN -> company ka sthir ISIN.
+
+        NSE face value badalne par naya ISIN de deta hai. Cloud ke liye wo
+        BILKUL NAYA security ban jaata tha: purani series ek ISIN par, nayi
+        doosre par. Nateeja -- 252-session wali shart par naya naam fail kar
+        jaata aur ~1 saal ke liye sheet se GAYAB ho jaata, aur jo bacha rehta
+        uska R12 aadhi series par banta.
+
+        Naapa gaya (8-Sep-2026, cloud ke 500-session store me): 31 symbol ki
+        series do tukdo me padi thi. TDPOWERSYS ka ISIN 24-Aug ko badla tha --
+        laptop ke backtest me wo rank 11 par tha (yaani kharidne wala naam) aur
+        cloud ki file me tha hi nahi. V2RETAIL ka SCORE 0.403 se alag tha, jo
+        sabse bada farq tha -- wo bhi isi wajah se.
+
+        Ye file wahi naksha hai (VAJRA_DATA ke SourceISIN -> ISIN se). Iske
+        bina cloud purane tareeke se hi chalta hai, bas status.json me saaf
+        likh deta hai ki naksha nahi mila.
+        """
+        return self.root / "state" / "isin_lineage.parquet"
+
 
 def read_meta(paths: StatePaths) -> dict:
     if not paths.meta.exists():

@@ -184,3 +184,64 @@ def test_series_survives_the_universe_metrics_query(tmp_path: Path) -> None:
     by_symbol = metrics.set_index("Symbol")["Series"]
     assert by_symbol["AAA"] == "EQ"
     assert by_symbol["BBB"] == "BE"
+
+
+def test_isin_badalne_par_series_nahi_tootti(tmp_path: Path) -> None:
+    """NSE ISIN badle to bhi ek hi company ki series EK rehni chahiye.
+
+    8 September 2026 ko pakdi gayi. NSE face value badalne par naya ISIN de
+    deta hai. Cloud ke liye wo BILKUL naya security ban jaata tha, isliye ek
+    hi company ki price series do tukdo me pad jaati thi.
+
+    Naapa gaya (500-session store me): 31 symbol aise the. Do tarah ka nuksaan:
+      * naya tukda 252-session wali shart par fail -> naam ~1 saal ke liye
+        sheet se GAYAB. TDPOWERSYS ka ISIN 24-Aug ko badla tha; laptop ke
+        backtest me wo rank 11 par tha -- yaani kharidne wala naam -- aur
+        cloud ki file me tha hi nahi.
+      * jo bacha rehta uska R12 aadhi series par banta. V2RETAIL ka SCORE
+        0.403 se alag tha, jo reconcile ka sabse bada farq tha.
+
+    Sudhaar ke baad SCORE ka farq 725 me se 725 naam par THEEK 0.0 ho gaya.
+
+    Ye test wahi ek sawaal poochta hai: do ISIN, ek company -- kya series
+    judti hai, aur kya bahar NSE ka AAJ ka ISIN dikhta hai?
+    """
+    from vajra_regime.cloud.signal import adjusted_frame
+
+    paths = StatePaths(tmp_path)
+    paths.prices.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({
+        "Date": [pd.Timestamp("2026-03-25").date(), pd.Timestamp("2026-03-26").date()],
+        "ISIN": ["INE000A01001", "INE000A01019"],   # NSE ne beech me ISIN badla
+        "Symbol": ["AAA", "AAA"],
+        "Series": ["EQ", "EQ"],
+        "Open": [100.0, 101.0], "High": [100.0, 101.0],
+        "Low": [100.0, 101.0], "Close": [100.0, 101.0],
+        "Volume": [10, 10], "TurnoverINR": [1000.0, 1010.0],
+        "Traded": [True, True], "IsFrozenBar": [False, False],
+        "AdjustedThrough": [None, None],
+        "EngineQuarantined": [False, False],
+    }).to_parquet(paths.prices, index=False)
+    pd.DataFrame({
+        "EventId": [], "ISIN": [], "Symbol": [], "ExDate": [],
+        "PriceFactor": [], "VolumeFactor": [], "ActionType": [], "ParseStatus": [],
+    }).to_parquet(paths.events, index=False)
+
+    # naksha ke BINA: do alag security (purana behaviour, jaan-boojh kar bacha
+    # hua taaki purani state file bina lineage ke bhi chalti rahe)
+    bina = adjusted_frame(paths)
+    assert bina["ISIN"].nunique() == 2
+
+    # naksha ke SAATH: ek hi company
+    pd.DataFrame({
+        "SourceISIN": ["INE000A01001", "INE000A01019"],
+        "CanonicalISIN": ["INE000A01001", "INE000A01001"],
+    }).to_parquet(paths.isin_lineage, index=False)
+
+    saath = adjusted_frame(paths)
+    assert saath["ISIN"].nunique() == 1, "ISIN badalne par series abhi bhi toot rahi hai"
+    assert set(saath["ISIN"]) == {"INE000A01001"}
+    # store me NSE ka apna ISIN jyon ka tyon rehta hai -- sheet me wahi dikhna hai
+    assert list(saath.sort_values("Date")["SourceISIN"]) == ["INE000A01001", "INE000A01019"]
+    # ek din par ek hi row -- warna pivot phat jaata hai
+    assert not saath.duplicated(subset=["Date", "ISIN"]).any()

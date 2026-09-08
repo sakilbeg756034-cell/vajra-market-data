@@ -49,7 +49,17 @@ def _prices(published: Path, sessions: int) -> pd.DataFrame:
                 SELECT DISTINCT Date FROM read_parquet('{glob}')
                 ORDER BY Date DESC LIMIT {sessions}
             )
-            SELECT Date, ISIN, Symbol,
+            SELECT Date,
+                   -- STORE ME NSE KA APNA ISIN JAATA HAI, company ka sthir id
+                   -- NAHI. Wajah: roz ke live rows NSE ke bhavcopy se aate
+                   -- hain aur unme NSE ka ISIN hi hota hai. Agar bootstrap
+                   -- sthir id likhe aur live rows NSE ka, to ek hi company ki
+                   -- series do tukdo me pad jaati hai -- theek wahi bug jo
+                   -- 8-Sep-2026 ko pakdi gayi (31 symbol tootay hue the).
+                   -- Ab dono taraf NSE ka ISIN hai, aur company ke sthir id
+                   -- par jodne ka kaam PADHTE waqt `isin_lineage` karta hai.
+                   COALESCE(SourceISIN, ISIN) AS ISIN,
+                   Symbol,
                    -- Published data 2026 se Series carry karta hai. Usse pehle
                    -- ke saal EQ-only bane the, isliye wahan COALESCE sach hi
                    -- bolta hai: jo rows maujood hain wo EQ hi hain.
@@ -85,13 +95,41 @@ def _event_calendar(published: Path) -> pd.DataFrame:
     """
     path = (published / "corporate_actions"
             / "official_nse_corporate_actions_all.parquet").as_posix()
+    prices = (published / "nifty750" / "parquet" / "nifty750_*.parquet").as_posix()
     with duckdb.connect() as con:
+        # ISIN KHUD NIKALNA PADTA HAI -- 8 September 2026.
+        #
+        # NSE ka corporate action feed SYMBOL se chalta hai, ISIN se nahi.
+        # Pehle publish ki gayi file me ek ISIN column tha, isliye yahan seedha
+        # `SELECT ISIN` likha tha. Wo column ab file me hai hi nahi, aur ye
+        # poora bootstrap "Referenced column ISIN not found" par ruk jaata tha.
+        # Kisi ko pata nahi chala kyunki bootstrap saal me ek baar chalta hai.
+        #
+        # Ab ISIN us Symbol ke apne bhaav-panel se aata hai: ex-date par (ya
+        # usse pehle ke sabse kareeb din par) us symbol ka company-ISIN. Yahi
+        # sahi bhi hai -- ek symbol apni zindagi me kai ISIN badal sakta hai,
+        # aur event uske USI daur ka hai.
         events = con.execute(
             f"""
-            SELECT DISTINCT EventId, ISIN, Symbol,
-                   CAST(ExDate AS DATE) AS ExDate, Subject
-            FROM read_parquet('{path}')
-            WHERE ExDate IS NOT NULL AND ISIN IS NOT NULL
+            WITH ev AS (
+                SELECT DISTINCT EventId, Symbol,
+                       CAST(ExDate AS DATE) AS ExDate, Subject
+                FROM read_parquet('{path}')
+                WHERE ExDate IS NOT NULL AND Symbol IS NOT NULL
+            ),
+            px AS (
+                SELECT Symbol, ISIN, min(Date) AS FirstDate, max(Date) AS LastDate
+                FROM read_parquet('{prices}')
+                GROUP BY Symbol, ISIN
+            )
+            SELECT ev.EventId, px.ISIN, ev.Symbol, ev.ExDate, ev.Subject
+            FROM ev JOIN px ON px.Symbol = ev.Symbol
+            QUALIFY row_number() OVER (
+                PARTITION BY ev.EventId
+                -- Jo daur ex-date ko ghere wo pehle; warna jo sabse kareeb ho.
+                ORDER BY (ev.ExDate BETWEEN px.FirstDate AND px.LastDate) DESC,
+                         abs(date_diff('day', px.LastDate, ev.ExDate))
+            ) = 1
             """
         ).df()
     parsed = [ca.classify_adjustment(str(s)) for s in events["Subject"]]
@@ -155,6 +193,28 @@ def _history_seed(published: Path, first_stored: pd.Timestamp) -> pd.DataFrame:
         ).df()
 
 
+def _isin_lineage(published: Path) -> pd.DataFrame:
+    """NSE ke har ISIN ka naksha: SourceISIN -> company ka sthir ISIN.
+
+    Wajah `StatePaths.isin_lineage` me poori likhi hai. Chhota saar: NSE face
+    value badalne par naya ISIN deta hai, aur uske bina cloud ek hi company ki
+    series ko do alag security samajh leta hai.
+
+    Jaanch (8-Sep-2026): 3,667 SourceISIN -> 3,098 company, aur EK BHI
+    SourceISIN do company par nahi jaata. Yaani ye naksha ek saaf function hai.
+    """
+    glob = (published / "nifty750" / "parquet" / "nifty750_*.parquet").as_posix()
+    with duckdb.connect() as con:
+        return con.execute(
+            f"""
+            SELECT DISTINCT SourceISIN, ISIN AS CanonicalISIN
+            FROM read_parquet('{glob}')
+            WHERE SourceISIN IS NOT NULL AND ISIN IS NOT NULL
+            ORDER BY SourceISIN
+            """
+        ).df()
+
+
 def run(published: Path, out: Path, sessions: int) -> dict:
     paths = StatePaths(out)
     paths.prices.parent.mkdir(parents=True, exist_ok=True)
@@ -167,11 +227,13 @@ def run(published: Path, out: Path, sessions: int) -> dict:
     events = _event_calendar(published)
     seed = _history_seed(published, first)
     ath = _ath_seed(published)
+    lineage = _isin_lineage(published)
 
     prices.to_parquet(paths.prices, index=False, compression="zstd")
     events.to_parquet(paths.events, index=False)
     seed.to_parquet(paths.history_counts, index=False)
     ath.to_parquet(paths.ath_seed, index=False)
+    lineage.to_parquet(paths.isin_lineage, index=False)
 
     meta = {
         "bootstrapped_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -182,6 +244,8 @@ def run(published: Path, out: Path, sessions: int) -> dict:
         "rows": int(len(prices)),
         "securities": int(prices["ISIN"].nunique()),
         "event_calendar_rows": int(len(events)),
+        "isin_lineage_rows": int(len(lineage)),
+        "isin_lineage_companies": int(lineage["CanonicalISIN"].nunique()) if len(lineage) else 0,
         "ath_seed_rows": int(len(ath)),
         "ath_covers_from": str(pd.Timestamp(ath["FirstSeen"].min()).date()),
         "adjusted_through": str(pd.Timestamp(prices["Date"].max()).date()),
