@@ -29,7 +29,7 @@ if (-not (Test-Path -LiteralPath $Script)) { throw "Engine runner not found: $Sc
 
 $Action = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
-    -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Script`"" `
+    -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Script`"" `
     -WorkingDirectory (Join-Path $EngineRoot "code")
 
 # 19:30 IST: comfortably after the 15:30 close and after NSE has published the day's bhavcopy.
@@ -52,9 +52,8 @@ $Settings = New-ScheduledTaskSettingsSet `
 
 $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
-Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue
-
 Register-ScheduledTask `
+    -Force `
     -TaskName $TaskName `
     -TaskPath $TaskPath `
     -Action $Action `

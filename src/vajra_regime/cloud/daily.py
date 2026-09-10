@@ -21,6 +21,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import urllib.request
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -178,6 +179,13 @@ def refresh_corporate_actions(paths: StatePaths, today: date) -> int:
 def _attach_isin(paths: StatePaths, events: pd.DataFrame) -> pd.DataFrame:
     """Symbol se ISIN nikalo -- sirf tab jab jawab ek hi ho."""
     prices = pd.read_parquet(paths.prices, columns=["Symbol", "ISIN"])
+    # A known ISIN transition is one company, not an ambiguous symbol.
+    # Only the explicit lineage map may resolve it; never infer from names.
+    lineage = signal.isin_lineage(paths)
+    if not lineage.empty:
+        lookup = lineage.set_index("SourceISIN")["CanonicalISIN"]
+        prices["ISIN"] = prices["ISIN"].map(lookup).fillna(prices["ISIN"])
+    prices["Symbol"] = prices["Symbol"].astype(str).str.strip().str.upper()
     pairs = prices.drop_duplicates()
     counts = pairs.groupby("Symbol")["ISIN"].nunique()
     unique = counts[counts == 1].index
@@ -185,7 +193,7 @@ def _attach_isin(paths: StatePaths, events: pd.DataFrame) -> pd.DataFrame:
               .drop_duplicates("Symbol").set_index("Symbol")["ISIN"])
 
     out = events.copy()
-    out["ISIN"] = out["Symbol"].astype(str).str.upper().map(lookup)
+    out["ISIN"] = out["Symbol"].astype(str).str.strip().str.upper().map(lookup)
     return out[out["ISIN"].notna()].copy()
 
 
@@ -278,10 +286,21 @@ def run(root: Path, today: date, scratch: Path) -> dict:
     have = {pd.Timestamp(d).date() for d in have}
     last_stored = max(have)
 
+    # Never discard the oldest missing dates and then report a fresh signal.
+    # Recovery beyond this bounded run needs an explicit store rebuild.
+    gap_days = (today - last_stored).days
+    if gap_days < 0:
+        raise RuntimeError("Cloud store contains a future session; build stopped")
+    if gap_days > MAX_CATCHUP_SESSIONS:
+        raise RuntimeError(
+            f"Cloud catch-up gap is {gap_days} calendar days, limit "
+            f"{MAX_CATCHUP_SESSIONS}; rebuild state without skipping sessions"
+        )
+
     wanted = [
         last_stored + timedelta(days=n)
         for n in range(1, (today - last_stored).days + 1)
-    ][-MAX_CATCHUP_SESSIONS:]
+    ]
 
     scratch.mkdir(parents=True, exist_ok=True)
     added_rows, added_days, holidays = 0, [], []
@@ -299,11 +318,6 @@ def run(root: Path, today: date, scratch: Path) -> dict:
     table = signal.rank_table(paths, _seed_history(paths))
     asof = table.attrs["asof"]
     asof_date = pd.Timestamp(asof).date()
-
-    out = root / "out"
-    out.mkdir(parents=True, exist_ok=True)
-    table.to_csv(out / "latest_signals.csv", index=False)
-    table[["SYMBOL", "ISIN"]].to_csv(out / "universe_current.csv", index=False)
 
     eligible = int((table["ELIGIBLE"] == "HAAN").sum())
     top = table[table["RANK"].notna()].head(signal.N_HOLDINGS)
@@ -324,9 +338,21 @@ def run(root: Path, today: date, scratch: Path) -> dict:
         "corporate_action_events_known": events,
         "reference_names_known": reference,
     }
-    (out / "status.json").write_text(
-        json.dumps(status, indent=2), encoding="utf-8"
-    )
+    # Validate BEFORE touching the last published outputs, including local runs.
+    _gate(status, table, asof_date, today)
+    out = root / "out"
+    out.mkdir(parents=True, exist_ok=True)
+    # Serialize all files first. Each replacement is atomic on the same volume;
+    # GitHub publishes the resulting directory together in its output commit.
+    with tempfile.TemporaryDirectory(dir=root, prefix=".signal-stage-") as stage:
+        staging = Path(stage)
+        table.to_csv(staging / "latest_signals.csv", index=False)
+        table[["SYMBOL", "ISIN"]].to_csv(staging / "universe_current.csv", index=False)
+        (staging / "status.json").write_text(
+            json.dumps(status, indent=2), encoding="utf-8"
+        )
+        for name in ("latest_signals.csv", "universe_current.csv", "status.json"):
+            os.replace(staging / name, out / name)
 
     meta.update({
         "last_run_utc": status["generated_at_utc"],
@@ -335,7 +361,6 @@ def run(root: Path, today: date, scratch: Path) -> dict:
     })
     write_meta(paths, meta)
 
-    _gate(status, table, asof_date, today)
     return status
 
 
@@ -356,10 +381,21 @@ def _gate(status: dict, table: pd.DataFrame, asof: date, today: date) -> None:
             f"sirf {status['eligible']} eligible naam "
             f"(kam se kam {MIN_ELIGIBLE_NAMES} chahiye)"
         )
-    if len(status["top_symbols"]) < signal.N_HOLDINGS:
+    ranks = pd.to_numeric(table["RANK"], errors="coerce")
+    ranked = ranks.dropna()
+    top = table[ranks.between(1, signal.N_HOLDINGS)]
+    if ranked.duplicated().any() or not ranked.eq(ranked.round()).all() or (ranked < 1).any():
+        problems.append("RANK must contain unique positive integers")
+    if len(top) != signal.N_HOLDINGS:
         problems.append(
-            f"top-{signal.N_HOLDINGS} me sirf {len(status['top_symbols'])} naam mile"
+            f"top-{signal.N_HOLDINGS} me {len(top)} naam mile"
         )
+    if not table.loc[ranks.notna(), "ELIGIBLE"].eq("HAAN").all():
+        problems.append("ineligible name has a trade rank")
+    if "SERIES" not in table or not table.loc[ranks.notna(), "SERIES"].eq("EQ").all():
+        problems.append("ranked names must have verified EQ series")
+    if asof > today:
+        problems.append("signal date is in the future")
     if (today - asof).days > 10:
         problems.append(
             f"signal {asof} ka hai par aaj {today} hai -- data aage badha hi nahi"

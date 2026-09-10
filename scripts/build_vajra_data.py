@@ -2,8 +2,9 @@
 
     D:\\VAJRA_ENGINE\\venv\\Scripts\\python.exe D:\\VAJRA_ENGINE\\code\\scripts\\build_vajra_data.py
 
-Lagbhag 15-25 minute. **Network ko chhoo-ta tak nahi** -- bhavcopy pehle se
-utri hui hoti hai (engine ka roz ka run wo kaam kar chuka hota hai).
+Lagbhag 15-25 minute. Bhavcopy pehle se utri honi chahiye (poora daily runner
+wo kaam karta hai). Ye builder network se corporate-action feed refresh karta
+hai; missing bhavcopy download nahi karta.
 
 KYA BANTA HAI
 =============
