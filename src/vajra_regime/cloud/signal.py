@@ -240,7 +240,11 @@ def adjusted_frame(paths: StatePaths) -> pd.DataFrame:
 
 def _pivot(frame: pd.DataFrame, column: str, fill=None) -> pd.DataFrame:
     out = frame.pivot(index="Date", columns="ISIN", values=column).sort_index()
-    return out if fill is None else out.fillna(fill)
+    if fill is None:
+        return out
+    if isinstance(fill, bool):
+        return out.astype("boolean").fillna(fill).astype(bool)
+    return out.fillna(fill)
 
 
 def matrices(frame: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -326,6 +330,19 @@ def vajra750_membership(metrics: pd.DataFrame,
     last_traded = metrics.pivot(index="Date", columns="ISIN",
                                 values="LastTradedDate").sort_index()
 
+    # Match monthly_universe.py: each security's latest available snapshot,
+    # at most seven calendar days old, must pass the filters BEFORE top-750.
+    # Filtering BE/BZ only at signal time wastes universe slots and excludes
+    # eligible replacements such as UNIPARTS from the live ranking.
+    series = metrics.pivot(index="Date", columns="ISIN", values="Series").sort_index().ffill()
+    quarantined = (metrics.pivot(index="Date", columns="ISIN",
+                                values="EngineQuarantined").sort_index()
+                   .astype("boolean").ffill())
+    median60 = median60.ffill()
+    observations = observations.ffill()
+    rows_in_store = rows_in_store.ffill()
+    last_traded = last_traded.ffill()
+
     # Store sirf ~500 session rakhta hai, isliye ginti yahin se shuru karna galat
     # hoga -- 15 saal purana naam naya dikhta aur 252-session ki shart par fail
     # kar jaata. Bootstrap ke waqt ki asli ginti seed hoti hai.
@@ -348,8 +365,13 @@ def vajra750_membership(metrics: pd.DataFrame,
             & (observations.loc[rd] >= MIN_TURNOVER_OBSERVATIONS)
             & (median60.loc[rd] > 0)
             & (stale <= STALE_CALENDAR_DAYS)
+            & series.loc[rd].eq("EQ")
+            & quarantined.loc[rd].eq(False)
         )
-        ranked = median60.loc[rd].where(eligible).sort_values(ascending=False)
+        # Columns are ISIN-sorted; stable sorting preserves the engine's
+        # ISIN tie-break, and missing/ineligible candidates never fill slots.
+        ranked = median60.loc[rd].where(eligible).dropna().sort_values(
+            ascending=False, kind="stable")
         chosen = ranked.head(UNIVERSE_SIZE).index
         stop = rebalances[i + 1] if i + 1 < len(rebalances) else idx[-1]
         member.loc[(idx > rd) & (idx <= stop), chosen] = True
@@ -442,7 +464,7 @@ def quarantine(paths: StatePaths, frame: pd.DataFrame, close: pd.DataFrame,
     # wale hain).
     engine_din_ka = (frame.pivot(index="Date", columns="ISIN", values="EngineQuarantined")
                      .reindex(index=close.index, columns=close.columns)
-                     .fillna(False).astype(bool))
+                     .astype("boolean").fillna(False).astype(bool))
     flagged = pd.DataFrame(False, index=close.index, columns=close.columns)
 
     # 1. Anupaat-heen corporate action -- sirf bootstrap ke baad wale.
