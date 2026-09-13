@@ -30,7 +30,7 @@ import pandas as pd
 
 from vajra_regime import corporate_actions as ca
 from vajra_regime import nse_live
-from vajra_regime.cloud import signal
+from vajra_regime.cloud import lineage_update, signal
 from vajra_regime.cloud.state import StatePaths, append_sessions, read_meta, write_meta
 
 # Ek run me itne se zyada session peeche nahi jaayenge. Laptop mahine bhar band
@@ -312,6 +312,10 @@ def run(root: Path, today: date, scratch: Path) -> dict:
         added_rows += append_sessions(paths, frame)
         added_days.append(day.isoformat())
 
+    # Naye ISIN badlav corporate action se PEHLE jodne hain: `_attach_isin`
+    # isi naksha se symbol ko company par laata hai. Ulta kram hone par
+    # face-value split ka apna event "ek symbol, do ISIN" maan kar chhoot jaata.
+    lineage_report = lineage_update.extend(paths)
     events = refresh_corporate_actions(paths, today)
     reference = refresh_reference(paths)
 
@@ -337,6 +341,10 @@ def run(root: Path, today: date, scratch: Path) -> dict:
         "holidays_or_unpublished": holidays,
         "corporate_action_events_known": events,
         "reference_names_known": reference,
+        # Naye ISIN badlav: jo joda gaya, aur jo haal ka naya ISIN kisi purane
+        # tukde se nahi juda. Doosri list khaali na ho to sheet chetavni deti hai.
+        "isin_lineage_added": lineage_report["added"],
+        "isin_lineage_unresolved": lineage_report["unresolved"],
     }
     # Validate BEFORE touching the last published outputs, including local runs.
     _gate(status, table, asof_date, today)

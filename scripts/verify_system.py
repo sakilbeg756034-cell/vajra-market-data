@@ -301,6 +301,31 @@ def check_consistency():
         f"signal.py me naksha={'haan' if has_lineage else 'NAHI'}  "
         f"state.py me file={'haan' if 'isin_lineage' in st_py else 'NAHI'}")
 
+    # Sheet ki SHARE ACTION backtest ke niyam par hai? (14-Sep-2026)
+    # Sheet `fastbt.py` ka keep/adds/weight/2% band dohrati hai, aur do number
+    # apne CFG me likhti hai. Do jagah likha number bina milaan ke khisakta hai.
+    band_fb = grab(fb, r"thr\s*=\s*([\d.]+)\s*\*\s*navnow")
+    for name, want, got in (
+        ("sheet: ek naam me max weight", lock["max_weight"],
+         grab(gs, r"^\s*MAX_WEIGHT:\s*([\d.]+)")),
+        ("sheet: rebalance ka 2% band", band_fb,
+         grab(gs, r"^\s*REBALANCE_BAND:\s*([\d.]+)")),
+    ):
+        same = want is not None and got is not None and float(want) == float(got)
+        (ok if same else bad)(name, f"backtest={want}  sheet={got}")
+
+    # Naye ISIN badlav cloud par apne aap judte hain? (14-Sep-2026)
+    # Bina iske naksha sirf bootstrap ke din tak ka hai, aur face value badalne
+    # wala har naam ~1 saal ke liye sheet se chup-chaap gayab ho jaata.
+    daily_py = (ENGINE / "code/src/vajra_regime/cloud/daily.py").read_text(encoding="utf-8")
+    li = daily_py.find("lineage_update.extend(paths)")
+    ci = daily_py.find("= refresh_corporate_actions(paths, today)")
+    upd = ENGINE / "code/src/vajra_regime/cloud/lineage_update.py"
+    (ok if (upd.exists() and 0 <= li < ci) else bad)(
+        "naye ISIN badlav cloud par apne aap judte hain",
+        f"lineage_update.py={'haan' if upd.exists() else 'NAHI'}  "
+        f"corporate action se pehle={'haan' if 0 <= li < ci else 'NAHI'}")
+
 
 # ==================================================================== 4
 def check_live():
