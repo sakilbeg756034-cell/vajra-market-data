@@ -73,6 +73,10 @@ REFERENCE_URL = ("https://niftyindices.com/IndexConstituent/"
 MIN_ELIGIBLE_NAMES = 300
 MIN_UNIVERSE_ROWS = 500
 
+# Signal itne calendar din se purana ho to run RED. Ye hadd DO jagah lagti hai
+# -- `_gate` me aur "naya din nahi, ruko" wale raste par -- isliye ek hi naam.
+MAX_SIGNAL_AGE_DAYS = 10
+
 
 def _bhavcopy_for(day: date, scratch: Path) -> pd.DataFrame | None:
     """Ek din ki as-traded rows (EQ + surveillance BE/BZ). Chhutti par None.
@@ -368,6 +372,13 @@ def run(root: Path, today: date, scratch: Path, force: bool = False) -> dict:
     # naye session ke run me lagta hai, usi shaam nahi. Haath se chalaya run
     # (`--force`) hamesha poora hisaab dobara karta hai.
     if not added_days and not force and _already_published(root, last_stored):
+        # Rukne se pehle PURANA-DATA wali chetavni. Bina iske NSE ka data hafton
+        # na aaye to har koshish chup-chaap "skipped" deti: run kabhi RED nahi
+        # hota aur GitHub email nahi aata (14-Sep-2026 ko pakda). `_gate` wala
+        # hi niyam aur wahi sandesh -- do jagah do niyam nahi.
+        stale = _stale_problem(last_stored, today)
+        if stale:
+            raise SystemExit("CLOUD SIGNAL BUILD ROKA GAYA:\n  - " + stale)
         print(f"koi naya session nahi -- {last_stored} pehle se publish hai; run yahin ruka")
         return {"skipped": True, "as_of_session": last_stored.isoformat(),
                 "holidays_or_unpublished": holidays}
@@ -432,6 +443,13 @@ def run(root: Path, today: date, scratch: Path, force: bool = False) -> dict:
     return status
 
 
+def _stale_problem(asof: date, today: date) -> str | None:
+    """Signal hadd se purana hai? Hai to wajah, warna None."""
+    if (today - asof).days > MAX_SIGNAL_AGE_DAYS:
+        return f"signal {asof} ka hai par aaj {today} hai -- data aage badha hi nahi"
+    return None
+
+
 def _gate(status: dict, table: pd.DataFrame, asof: date, today: date) -> None:
     """Galat file likhne se behtar hai koi nayi file na likhna.
 
@@ -464,10 +482,9 @@ def _gate(status: dict, table: pd.DataFrame, asof: date, today: date) -> None:
         problems.append("ranked names must have verified EQ series")
     if asof > today:
         problems.append("signal date is in the future")
-    if (today - asof).days > 10:
-        problems.append(
-            f"signal {asof} ka hai par aaj {today} hai -- data aage badha hi nahi"
-        )
+    stale = _stale_problem(asof, today)
+    if stale:
+        problems.append(stale)
     if problems:
         raise SystemExit(
             "CLOUD SIGNAL BUILD ROKA GAYA:\n  - " + "\n  - ".join(problems)

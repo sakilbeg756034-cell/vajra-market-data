@@ -115,3 +115,43 @@ def test_cli_force_flag_reaches_run(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(daily, "run", fake_run)
     assert daily.main(["--root", str(tmp_path), "--today", "2026-09-14", "--force"]) == 0
     assert seen == {"force": True}
+
+
+def _no_nse_no_rebuild(monkeypatch):
+    monkeypatch.setattr(daily, "_bhavcopy_for", lambda *a: None)
+    for name in ("refresh_corporate_actions", "refresh_reference"):
+        monkeypatch.setattr(daily, name, lambda *a: pytest.fail("NSE API must not be called"))
+    monkeypatch.setattr(daily.lineage_update, "extend", lambda *a: pytest.fail("no rebuild"))
+    monkeypatch.setattr(daily.signal, "rank_table", lambda *a: pytest.fail("no rebuild"))
+
+
+def test_skip_path_still_fails_loudly_when_data_is_stale(tmp_path, monkeypatch):
+    # NSE hafton data na de: pehle har koshish chup-chaap "skipped" deti thi.
+    paths, out = _published(tmp_path, D)
+    _no_nse_no_rebuild(monkeypatch)
+    before = paths.prices.read_bytes()
+    with pytest.raises(SystemExit, match="data aage badha hi nahi"):
+        daily.run(tmp_path, D + timedelta(days=daily.MAX_SIGNAL_AGE_DAYS + 1), tmp_path / "scratch")
+    assert (out / "latest_signals.csv").read_bytes() == b"published"
+    assert paths.prices.read_bytes() == before
+
+
+def test_skip_path_at_the_age_limit_still_skips(tmp_path, monkeypatch):
+    _published(tmp_path, D)
+    _no_nse_no_rebuild(monkeypatch)
+    status = daily.run(tmp_path, D + timedelta(days=daily.MAX_SIGNAL_AGE_DAYS), tmp_path / "scratch")
+    assert status["skipped"] is True
+
+
+def test_gate_and_skip_path_share_one_age_rule():
+    assert daily.MAX_SIGNAL_AGE_DAYS == 10
+    assert daily._stale_problem(D, D + timedelta(days=10)) is None
+    assert "data aage badha hi nahi" in daily._stale_problem(D, D + timedelta(days=11))
+    table = pd.DataFrame({
+        "RANK": list(range(1, 501)), "SYMBOL": [f"S{i}" for i in range(500)],
+        "ISIN": [f"I{i}" for i in range(500)], "ELIGIBLE": ["HAAN"] * 500,
+        "SERIES": ["EQ"] * 500,
+    })
+    daily._gate({"eligible": 500}, table, D, D + timedelta(days=10))
+    with pytest.raises(SystemExit, match="data aage badha hi nahi"):
+        daily._gate({"eligible": 500}, table, D, D + timedelta(days=11))
