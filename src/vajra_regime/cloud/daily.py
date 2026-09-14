@@ -17,11 +17,14 @@ adjustment classifier -- teenon engine ke wahi tested function hain.
 from __future__ import annotations
 
 import argparse
+import http.client
 import io
 import json
 import os
 import sys
 import tempfile
+import time
+import urllib.error
 import urllib.request
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -116,6 +119,42 @@ def _bhavcopy_for(day: date, scratch: Path) -> pd.DataFrame | None:
     return out
 
 
+# NSE ka corporate action API kabhi-kabhi ek request par atak jaata hai --
+# timeout, 5xx, ya JSON ki jagah HTML. Pehle ek hi jhatke se us koshish ka
+# POORA signal ruk jaata tha. Ab teen koshish, beech me thoda intezaar. Teeno
+# fail hon to run pehle ki tarah RED hota hai -- purane event par chup-chaap
+# signal nahi banta. Code ki galti (KeyError wagairah) dobara nahi aazmayi jaati.
+CA_FETCH_ATTEMPTS = 3
+CA_RETRY_WAIT_SECONDS = (30, 90)
+_RETRYABLE = (urllib.error.URLError, TimeoutError, ConnectionError,
+              http.client.HTTPException, ValueError)
+_sleep = time.sleep
+
+
+def _fetch_ca_rows(start: date, today: date) -> list[dict]:
+    """NSE CA calendar ki saari rows -- network ki chhoti gadbad par dobara koshish."""
+    last: Exception | None = None
+    for attempt in range(1, CA_FETCH_ATTEMPTS + 1):
+        try:
+            # Har koshish naye cookie/session ke saath, poori list shuru se.
+            opener = ca._nse_opener()
+            rows: list[dict] = []
+            for chunk_start, chunk_end in ca._chunk_dates(start, today):
+                _payload, chunk = ca._fetch_ca_json(opener, chunk_start, chunk_end)
+                rows.extend(chunk)
+            return rows
+        except _RETRYABLE as exc:
+            last = exc
+            if attempt < CA_FETCH_ATTEMPTS:
+                wait = CA_RETRY_WAIT_SECONDS[attempt - 1]
+                print(f"NSE corporate action feed: koshish {attempt}/{CA_FETCH_ATTEMPTS} "
+                      f"fail ({exc}); {wait}s baad dobara")
+                _sleep(wait)
+    raise RuntimeError(
+        f"NSE corporate action feed {CA_FETCH_ATTEMPTS} koshish ke baad bhi nahi mila: {last}"
+    ) from last
+
+
 def refresh_corporate_actions(paths: StatePaths, today: date) -> int:
     """CA calendar dobara laao aur har event ka price factor nikalo.
 
@@ -124,12 +163,7 @@ def refresh_corporate_actions(paths: StatePaths, today: date) -> int:
     aur signal.py use chhod deta hai: bina anupaat ke andaaza lagana hi wo galti
     hai jisse CUPID wala +406% bana tha.
     """
-    opener = ca._nse_opener()
-    start = today - timedelta(days=CA_LOOKBACK_DAYS)
-    rows: list[dict] = []
-    for chunk_start, chunk_end in ca._chunk_dates(start, today):
-        _payload, chunk = ca._fetch_ca_json(opener, chunk_start, chunk_end)
-        rows.extend(chunk)
+    rows = _fetch_ca_rows(today - timedelta(days=CA_LOOKBACK_DAYS), today)
 
     normalized = ca.normalize_corporate_action_rows(rows)
     if normalized.empty:
@@ -273,7 +307,16 @@ def _seed_history(paths: StatePaths) -> pd.Series | None:
     return seed.set_index("ISIN")["HistoryCount"].astype(float)
 
 
-def run(root: Path, today: date, scratch: Path) -> dict:
+def _already_published(root: Path, session: date) -> bool:
+    """out/status.json isi session ka hai? Padh na paaye to NAHI -- andaaza nahi."""
+    try:
+        status = json.loads((root / "out" / "status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(status, dict) and status.get("as_of_session") == session.isoformat()
+
+
+def run(root: Path, today: date, scratch: Path, force: bool = False) -> dict:
     paths = StatePaths(root)
     if not paths.prices.exists():
         raise FileNotFoundError(
@@ -311,6 +354,23 @@ def run(root: Path, today: date, scratch: Path) -> dict:
             continue
         added_rows += append_sessions(paths, frame)
         added_days.append(day.isoformat())
+
+    # NAYA DIN NAHI AAYA -- TURANT RUKO (14-Sep-2026).
+    #
+    # Workflow ab 16:37 IST se har 15 minute chalta hai, kyunki NSE bhavcopy
+    # ~16:33 IST par daalta hai. Zyadatar koshishon me naya din hota hi nahi.
+    # Tab corporate action API aur reference list dobara maangna NSE par faltu
+    # bojh hai -- aur baar-baar maangne par NSE GitHub ko block kar sakta hai,
+    # jisse poora live signal band ho jaata. Jo session pehle hi publish ho
+    # chuka hai uska signal dobara banane se kuch naya nahi milta.
+    #
+    # Keemat: kisi purane din ka corporate action NSE der se jode, to wo agle
+    # naye session ke run me lagta hai, usi shaam nahi. Haath se chalaya run
+    # (`--force`) hamesha poora hisaab dobara karta hai.
+    if not added_days and not force and _already_published(root, last_stored):
+        print(f"koi naya session nahi -- {last_stored} pehle se publish hai; run yahin ruka")
+        return {"skipped": True, "as_of_session": last_stored.isoformat(),
+                "holidays_or_unpublished": holidays}
 
     # Naye ISIN badlav corporate action se PEHLE jodne hain: `_attach_isin`
     # isi naksha se symbol ko company par laata hai. Ulta kram hone par
@@ -420,9 +480,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="vajra-signals repo ka checkout")
     parser.add_argument("--today", type=date.fromisoformat, default=None)
     parser.add_argument("--scratch", type=Path, default=Path("_scratch"))
+    parser.add_argument("--force", action="store_true",
+                        help="naya session na ho tab bhi poora signal dobara banao")
     args = parser.parse_args(argv)
 
-    status = run(args.root, args.today or datetime.now(UTC).date(), args.scratch)
+    status = run(args.root, args.today or datetime.now(UTC).date(), args.scratch,
+                 force=args.force)
     print(json.dumps(status, indent=2))
     return 0
 
