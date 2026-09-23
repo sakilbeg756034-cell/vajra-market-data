@@ -90,7 +90,17 @@ try {
     finally {
         Pop-Location
     }
-    Write-Status -Status "SUCCESS" -Message "Bhavcopy taaza, D:\VAJRA_DATA dobara ban gaya." -ExitCode 0
+    # 24-Sep-2026: build_vajra_data.py kuch naya na ho to dataset dobara nahi
+    # banata. Status wahi kahe jo sach me hua -- "dobara ban gaya" tabhi.
+    $Message = "Bhavcopy taaza, D:\VAJRA_DATA dobara ban gaya."
+    $ResultPath = Join-Path $EngineRoot "logs\latest_dataset_build.json"
+    try {
+        $Result = Get-Content -LiteralPath $ResultPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($Result.action -eq "SKIPPED_NOTHING_NEW") {
+            $Message = "Bhavcopy taaza. Kuch naya nahi tha (na naya din, na naya corporate action) -- D:\VAJRA_DATA pehle jaisa sahi, dobara nahi banaya."
+        }
+    } catch { }
+    Write-Status -Status "SUCCESS" -Message $Message -ExitCode 0
     Write-Host "VAJRA DATA ENGINE: PASS"
     exit 0
 }
