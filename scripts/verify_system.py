@@ -380,12 +380,14 @@ def check_live():
         if cloud_st is not None:
             lag = (date.fromisoformat(cloud_st["as_of_session"])
                    - date.fromisoformat(local_st["as_of_session"])).days
-            (ok if lag == 0 else warn)(
+            # 24-Sep-2026: reconcile.py ab har run me main + state branch khud
+            # taaza karta hai aur alag din ka milaan mana karta hai. Isliye
+            # purana local clone ab khatra nahi -- sirf jaankari.
+            (ok if lag == 0 else info)(
                 "local clone cloud ke barabar hai",
                 f"local {local_st['as_of_session']}  cloud "
                 f"{cloud_st['as_of_session']}"
-                + ("" if lag == 0 else "  -- `git pull` chalao, warna "
-                                       "reconcile.py purani file se milaayega"))
+                + ("" if lag == 0 else "  -- reconcile.py chalte hi khud taaza kar lega"))
         if st["eligible"] >= st["universe_rows"]:
             bad("vol filter live me lag hi nahi raha",
                 f"eligible {st['eligible']} == universe {st['universe_rows']}")
@@ -727,6 +729,49 @@ def check_strategy_reproduces():
         bad("backtest fail", str(exc)[:150])
 
 
+# ==================================================================== 8
+def check_backup():
+    """Private GitHub backup (24-Sep-2026) zinda hai?
+
+    Backup ka fail hona paisa lagane ka sawal NAHI hai -- live signal aur sheet
+    usse nahi rukte. Isliye yahan sabse bura natija CHETAVNI hai, FAIL nahi.
+    Par chup bhi nahi: operator ne kaha hai "sabkuch AI hi karega", yaani ye
+    jaanch hi wo jagah hai jahan kisi ko pata chalta hai ki backup ruk gaya.
+    Script aur naksha: D:\\VAJRA SYSTEM GATE\\backup\\vajra_backup.py
+    """
+    head("8. BACKUP -- private GitHub repo vajra-backup")
+    status = Path(r"D:\VAJRA_BACKUP\_logs\last_backup.json")
+    if not status.exists():
+        warn("backup ka record nahi mila", f"{status} -- backup kabhi chala hi nahi?")
+        return
+    try:
+        st = json.loads(status.read_text(encoding="utf-8"))
+        when = datetime.fromisoformat(st["time_local"])
+    except Exception as exc:                                          # noqa: BLE001
+        warn("backup ka record padha nahi gaya", str(exc)[:80])
+        return
+    age = (datetime.now() - when).days
+    if st.get("status") != "SUCCESS":
+        warn("aakhri backup FAIL hua",
+             f"{when:%Y-%m-%d %H:%M}: {str(st.get('error', ''))[:120]} -- "
+             "aksar GitHub login expire; operator khud `gh auth login` kare")
+    elif age > 14:
+        warn("backup purana hai", f"aakhri safal {when:%Y-%m-%d} ({age} din) -- "
+             "task `\\VAJRA\\VAJRA Backup` dekho")
+    else:
+        ok("aakhri backup", f"SUCCESS {when:%Y-%m-%d %H:%M} ({age} din)")
+    try:
+        p = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-ScheduledTask -TaskPath '\\VAJRA\\' -TaskName 'VAJRA Backup').State"],
+            capture_output=True, text=True, timeout=60)
+        state = (p.stdout or "").strip()
+        (ok if state in ("Ready", "Running") else warn)(
+            "backup ka Sunday task", state or "nahi mila -- backup\\install_backup_task.ps1 chalao")
+    except Exception as exc:                                          # noqa: BLE001
+        warn("backup task dekha nahi gaya", str(exc)[:80])
+
+
 # ==================================================================== main
 def main() -> int:
     print("=" * 92)
@@ -741,6 +786,7 @@ def main() -> int:
     check_schedule()
     check_engine_tests()
     check_strategy_reproduces()
+    check_backup()
 
     n_ok = sum(1 for s, _, _ in results if s == "PASS")
     n_bad = sum(1 for s, _, _ in results if s == "FAIL")
