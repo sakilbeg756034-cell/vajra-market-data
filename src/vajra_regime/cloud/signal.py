@@ -83,7 +83,7 @@ MAX_WEIGHT = 0.15
 # ke 10% hain, wo nahi liye jaate. Naapa gaya (2016 se aage, cost ke baad):
 #
 #     bina filter        30.57%  Sharpe 1.076  MaxDD -42.9%
-#     is filter ke saath 31.39%  Sharpe 1.165  MaxDD -44.3%
+#     is filter ke saath 31.39%  Sharpe 1.165  MaxDD -44.3%   [itihaas: 7-Sep data]
 #
 # Dhyan do: MaxDD is filter ke saath THODA KHARAB hota hai. Filter
 # isliye hai ki risk-adjusted return (Sharpe) saaf behtar hai.
