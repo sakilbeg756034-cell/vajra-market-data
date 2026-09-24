@@ -18,6 +18,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 
+from vajra_regime.ca_subject import UNRATIOED_KINDS
 from vajra_regime.cloud import core
 from vajra_regime.cloud.state import StatePaths
 
@@ -49,7 +50,9 @@ LOOKBACK_BLACKOUT = 252
 # cloud ko bhi wahi karna chahiye, warna cloud aisa naam khareedne ko keh dega
 # jo backtest ke universe me kabhi tha hi nahi. VEDL (demerger) reconciliation
 # me theek isi wajah se cloud me rank 44 par aa gaya tha.
-UNRATIOED_ACTION_TYPES = ("RIGHTS", "MERGER", "DEMERGER", "SPLIT", "BONUS")
+# 25-Sep-2026 se kism ki list `ca_subject` se (naye naam REVIEW_NEEDED,
+# BONUS_GAIR_EQUITY, CONSOLIDATION bhi) -- purane naam bhi saath, purani state ke liye.
+UNRATIOED_ACTION_TYPES = UNRATIOED_KINDS
 LONG_GAP_DAYS = 30
 LONG_GAP_RETURN = 0.20
 

@@ -34,7 +34,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from vajra_regime import corporate_actions as ca
+from vajra_regime import ca_subject
 from vajra_regime.cloud.state import RETAIN_SESSIONS, StatePaths, write_meta
 
 DEFAULT_PUBLISHED = Path(r"D:\VAJRA_DATA")
@@ -89,9 +89,9 @@ def _prices(published: Path, sessions: int) -> pd.DataFrame:
 def _event_calendar(published: Path) -> pd.DataFrame:
     """Poora NSE corporate action calendar, factor ke saath.
 
-    Factor `classify_adjustment` se aata hai -- wahi function jo engine chalata
-    hai. Jo event samajh na aaye (demerger, merger) uska factor None rehta hai
-    aur signal.py use chhod deta hai.
+    Factor `ca_subject` se aata hai -- laptop ka dataset bhi wahi use karta hai.
+    Demerger ka factor laptop ki chhapi table se. Jo event phir bhi samajh na
+    aaye (merger, rights) uska factor None rehta hai aur signal.py use chhod deta hai.
     """
     path = (published / "corporate_actions"
             / "official_nse_corporate_actions_all.parquet").as_posix()
@@ -132,17 +132,31 @@ def _event_calendar(published: Path) -> pd.DataFrame:
             ) = 1
             """
         ).df()
-    parsed = [ca.classify_adjustment(str(s)) for s in events["Subject"]]
-    return pd.DataFrame({
-        "EventId": events["EventId"].astype(str),
-        "ISIN": events["ISIN"].astype(str),
-        "Symbol": events["Symbol"].astype(str),
-        "ExDate": events["ExDate"],
-        "PriceFactor": [p.price_factor for p in parsed],
-        "VolumeFactor": [p.volume_factor for p in parsed],
-        "ActionType": [p.action_type for p in parsed],
-        "ParseStatus": [p.parse_status for p in parsed],
-    }).sort_values(["ExDate", "ISIN"]).reset_index(drop=True)
+    out = pd.DataFrame({
+        "EventId": events["EventId"].astype(str).to_numpy(),
+        "ISIN": events["ISIN"].astype(str).to_numpy(),
+        "Symbol": events["Symbol"].astype(str).to_numpy(),
+        "ExDate": events["ExDate"].to_numpy(),
+        **ca_subject.event_columns(events["Subject"].astype(str).tolist()),
+    })
+    # Demerger ka factor laptop ne ex-date ke KACHCHE bhaav se nikala hai
+    # (`ca_subject.demerger_price_factor`) aur dataset ke saath chhapa hai.
+    # Published bhaav adjusted hain, isliye yahan dobara nahi nikal sakte --
+    # wahi table padhi jaati hai (ek niyam, ek jawab).
+    dem_path = published / "corporate_actions" / "corporate_actions_demerger_price_based.parquet"
+    if dem_path.exists():
+        dem = pd.read_parquet(dem_path)
+        dem_ex = pd.to_datetime(dem["ExDate"]).dt.date
+        key = dict(zip(zip(dem["Symbol"].astype(str), dem_ex), dem["factor"].astype(float)))
+        ex = pd.to_datetime(out["ExDate"]).dt.date
+        for i, (sym, d) in enumerate(zip(out["Symbol"], ex)):
+            f = key.get((sym, d))
+            if f is not None and pd.isna(out.at[i, "PriceFactor"]):
+                out.at[i, "PriceFactor"] = f
+                out.at[i, "VolumeFactor"] = 1.0 / f
+                out.at[i, "ActionType"] = "DEMERGER_BHAAV"
+                out.at[i, "ParseStatus"] = "PARSED"
+    return out.sort_values(["ExDate", "ISIN"]).reset_index(drop=True)
 
 
 def _ath_seed(published: Path) -> pd.DataFrame:

@@ -31,6 +31,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from vajra_regime import ca_subject
 from vajra_regime import corporate_actions as ca
 from vajra_regime import nse_live
 from vajra_regime.cloud import lineage_update, signal
@@ -162,10 +163,11 @@ def _fetch_ca_rows(start: date, today: date) -> list[dict]:
 def refresh_corporate_actions(paths: StatePaths, today: date) -> int:
     """CA calendar dobara laao aur har event ka price factor nikalo.
 
-    Factor `classify_adjustment` se aata hai -- wahi function jo engine use karta
-    hai. Jo event samajh na aaye (demerger, merger) uska factor None rehta hai
-    aur signal.py use chhod deta hai: bina anupaat ke andaaza lagana hi wo galti
-    hai jisse CUPID wala +406% bana tha.
+    Factor `ca_subject` se aata hai -- wahi jo laptop ka dataset use karta hai.
+    Demerger ka factor ex-date ke bhaav se (`_demerger_factors`). Jo event phir
+    bhi samajh na aaye (merger, rights) uska factor None rehta hai aur signal.py
+    use chhod deta hai: bina anupaat ke andaaza lagana hi wo galti hai jisse
+    CUPID wala +406% bana tha.
     """
     rows = _fetch_ca_rows(today - timedelta(days=CA_LOOKBACK_DAYS), today)
 
@@ -186,17 +188,19 @@ def refresh_corporate_actions(paths: StatePaths, today: date) -> int:
     if normalized.empty:
         return 0
 
-    parsed = [ca.classify_adjustment(str(s)) for s in normalized["Subject"]]
+    # Factor EK jagah se -- `ca_subject` (laptop ka `ca_factor.py` bhi wahi).
+    # 25-Sep-2026 tak yahan purana `classify_adjustment` tha jo "Bonus 2:1/
+    # Dividend", "Bonus 1:1 And Face Value Split" aur "Fv Splt Frm" ko laptop se
+    # ALAG samajhta tha.
+    subjects = normalized["Subject"].astype(str).tolist()
     fresh = pd.DataFrame({
-        "EventId": normalized["EventId"].astype(str),
-        "ISIN": normalized["ISIN"].astype(str),
-        "Symbol": normalized["Symbol"].astype(str),
-        "ExDate": pd.to_datetime(normalized["ExDate"]).dt.date,
-        "PriceFactor": [p.price_factor for p in parsed],
-        "VolumeFactor": [p.volume_factor for p in parsed],
-        "ActionType": [p.action_type for p in parsed],
-        "ParseStatus": [p.parse_status for p in parsed],
+        "EventId": normalized["EventId"].astype(str).to_numpy(),
+        "ISIN": normalized["ISIN"].astype(str).to_numpy(),
+        "Symbol": normalized["Symbol"].astype(str).to_numpy(),
+        "ExDate": pd.to_datetime(normalized["ExDate"]).dt.date.to_numpy(),
+        **ca_subject.event_columns(subjects),
     })
+    fresh = _demerger_factors(paths, fresh, subjects)
 
     if paths.events.exists():
         old = pd.read_parquet(paths.events)
@@ -212,6 +216,50 @@ def refresh_corporate_actions(paths: StatePaths, today: date) -> int:
     paths.events.parent.mkdir(parents=True, exist_ok=True)
     fresh.to_parquet(paths.events, index=False)
     return int(len(fresh))
+
+
+def _demerger_factors(paths: StatePaths, events: pd.DataFrame, subjects: list) -> pd.DataFrame:
+    """Demerger ka factor ex-date ke bhaav se (ex-OPEN / pichhla CLOSE) -- 25-Sep-2026.
+
+    Niyam `ca_subject.demerger_price_factor` me hai (laptop bhi wahi). Pehle cloud
+    demerger ko adjust hi nahi karta tha: VEDL (30-Apr-2026) ki 24-Sep ki file me
+    R12 -42%, vol 111% -- nakli giraav se naam bahar. Store me OPEN hai, isliye
+    factor yahin nikalta hai. Ex-date ka bhaav abhi store me na ho (event aage ka
+    hai) to factor None rehta hai -- agli run me jab din aa jaaye tab lagega.
+
+    Bootstrap se pehle ke event (store ka adjusted hissa) par ratio ~1 aata hai
+    aur factor nahi lagta -- aur signal waise bhi AdjustedThrough ke baad ke hi
+    event lagata hai.
+    """
+    out = events.reset_index(drop=True).copy()
+    need = [i for i, f in enumerate(out["PriceFactor"])
+            if (f is None or pd.isna(f)) and ca_subject.demerger_kind(subjects[i]) is not None]
+    if not need:
+        return out
+    prices = pd.read_parquet(paths.prices, columns=["Date", "ISIN", "Open", "Close"])
+    lineage = signal.isin_lineage(paths)
+    if not lineage.empty:
+        lookup = lineage.set_index("SourceISIN")["CanonicalISIN"]
+        prices["ISIN"] = prices["ISIN"].map(lookup).fillna(prices["ISIN"])
+    prices["Date"] = pd.to_datetime(prices["Date"]).dt.date
+    by_isin = {k: g.sort_values("Date").reset_index(drop=True)
+               for k, g in prices.groupby("ISIN")}
+    for i in need:
+        g = by_isin.get(out.at[i, "ISIN"])
+        if g is None:
+            continue
+        hit = g.index[g["Date"] == out.at[i, "ExDate"]]
+        if len(hit) == 0 or hit[0] == 0:
+            continue
+        factor = ca_subject.demerger_price_factor(
+            subjects[i], g.at[hit[0], "Open"], g.at[hit[0] - 1, "Close"])
+        if factor is None:
+            continue
+        out.at[i, "PriceFactor"] = factor
+        out.at[i, "VolumeFactor"] = 1.0 / factor
+        out.at[i, "ActionType"] = "DEMERGER_BHAAV"
+        out.at[i, "ParseStatus"] = "PARSED"
+    return out
 
 
 def _attach_isin(paths: StatePaths, events: pd.DataFrame) -> pd.DataFrame:
