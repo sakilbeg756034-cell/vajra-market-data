@@ -65,8 +65,18 @@ def ensure_csv_present(universe: str, year: int) -> bool:
     return csv_path.is_file()
 
 
+RETIRED = (
+    "RETIRED 2026-09-26 (operator approval, AUDIT_2026-09-26 P-02). This drill deletes files inside the real\n"
+    "D:\\VAJRA_DATA. Since 2026-09-26 part of that dataset (2007-2011) is rebuilt from the PRE2011 frozen layer,\n"
+    "and a production-deleting drill must not be one command away. It now refuses to run. To re-test deletion\n"
+    "resilience, copy the pattern onto a throwaway VAJRA_DATA_ROOT (see drill2/drill3) - never on production."
+)
+
+
 def main() -> int:
-    scenarios: dict[str, dict] = {}
+    print(RETIRED)
+    return 2
+    scenarios: dict[str, dict] = {}  # noqa: unreachable - kept for the record
 
     # This drill is re-runnable, so start from a state where every CSV exists.
     recovery_worked = all(

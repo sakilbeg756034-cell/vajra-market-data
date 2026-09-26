@@ -147,8 +147,19 @@ def plan() -> list[dict]:
     return entries
 
 
+RETIRED = (
+    "RETIRED 2026-09-26 (operator approval, AUDIT_2026-09-26 P-01). This script was the one-off 2026-08-29\n"
+    "migration clean-up. Run today it would permanently delete everything on D: except four folders -\n"
+    "VAJRA_RESEARCH (the strategy lock), VAJRA SYSTEM GATE, the sheet scripts, the backup clone and the\n"
+    "historical backfill - and its preflight would pass, because the old store it compares against is gone.\n"
+    "It now refuses to run. Kept only as a record of what happened on 2026-08-29 (logs/deletion_record.json)."
+)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    print(RETIRED)
+    return 2
+    parser = argparse.ArgumentParser()  # noqa: unreachable - kept for the record
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--skip-preflight", action="store_true")
     args = parser.parse_args()
