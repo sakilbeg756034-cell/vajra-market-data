@@ -90,6 +90,7 @@ CA_FILES = [Path(r"D:\VAJRA_RESEARCH\work\ca_history\nse_corporate_actions.parqu
             Path(r"D:\VAJRA_RESEARCH\work\ca_history\nse_corporate_actions_2010_2026.parquet")]
 MEMBERSHIP = Path(r"D:\VAJRA_ENGINE\store\02 Master Historical Data\NIFTY500 Point In Time"
                   r"\07 Point In Time Panels\nifty500_daily_membership_certified.parquet")
+PRE2011_LAYER = Path(r"D:\VAJRA_ENGINE\store\02 Master Historical Data\PRE2011 Frozen Layer\current")
 CODE_FILES = sorted(SCRIPTS.glob("*.py")) + [
     Path(r"D:\VAJRA_ENGINE\code\src\vajra_regime\paths.py"), Path(__file__).resolve()]
 
@@ -114,7 +115,9 @@ def input_fingerprint() -> dict:
     code = hashlib.sha256()
     for p in CODE_FILES:
         code.update(p.name.encode() + b"\0" + p.read_bytes())
+    pre_man = PRE2011_LAYER / "MANIFEST.json"
     return {
+        "pre2011_layer": hashlib.sha256(pre_man.read_bytes()).hexdigest() if pre_man.exists() else None,
         "bhavcopy_zips": h.hexdigest(), "n_zips": n_zip,
         "corporate_actions": _frame_hash(ca) if ca else None,
         "membership": _frame_hash(MEMBERSHIP) if MEMBERSHIP.exists() else None,
@@ -151,7 +154,8 @@ def why_rebuild(now_in: dict, now_out: dict) -> list[str]:
     reasons = []
     labels = {"bhavcopy_zips": "NSE bhavcopy zip (naya din ya badli file)",
               "corporate_actions": "corporate action (naya split/bonus/koi event)",
-              "membership": "NIFTY 500 membership", "code": "build ka code"}
+              "membership": "NIFTY 500 membership", "code": "build ka code",
+              "pre2011_layer": "PRE2011 frozen layer"}
     for k, label in labels.items():
         if old.get("input", {}).get(k) != now_in.get(k):
             reasons.append(f"{label} badla")
