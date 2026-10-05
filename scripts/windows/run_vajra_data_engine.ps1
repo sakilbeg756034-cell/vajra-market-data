@@ -54,6 +54,24 @@ function Write-Status {
     Move-Item -LiteralPath $Temporary -Destination $StatusPath -Force
 }
 
+# EK WAQT ME SIRF EK RUN -- 5 October 2026.
+#
+# Us din 16:29 ka scheduled run aur 16:30 ka haath se chalaya run EK SAATH
+# chale. Dono `D:\VAJRA_RESEARCH\work\panel` ki wahi files likh rahe the; pehla
+# step 2 me "build_vajra_data.py exited 1" se gira aur latest_engine_run.json me
+# FAILED likh gaya -- jabki doosra theek chal raha tha. Ab named mutex: doosra run
+# kuch nahi chhoota, status file nahi chhoota, bas log likh kar exit 0 (jo run chal
+# raha hai wahi sach likhega). Process mare to Windows mutex khud chhod deta hai.
+$RunLock = New-Object System.Threading.Mutex($false, "Global\VAJRA_DATA_ENGINE_RUN")
+$HaveLock = $false
+try { $HaveLock = $RunLock.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $HaveLock = $true }
+if (-not $HaveLock) {
+    $SkipLog = Join-Path $LogsRoot "vajra_data_engine_${Timestamp}_SKIPPED_ALREADY_RUNNING.txt"
+    [System.IO.File]::WriteAllText($SkipLog, "SKIPPED_ALREADY_RUNNING: ek aur VAJRA data run pehle se chal raha hai ($((Get-Date).ToString('s'))).`n")
+    Write-Host "VAJRA DATA ENGINE: SKIPPED - ek aur run pehle se chal raha hai"
+    exit 0
+}
+
 Start-Transcript -Path $LogPath -Force | Out-Null
 
 # SABSE PEHLE "CHAL RAHA HAI" LIKH DO.
@@ -112,4 +130,14 @@ catch {
 }
 finally {
     Stop-Transcript | Out-Null
+    # WATCHDOG -- 5 October 2026. Har run ke baad: freshness, incident record,
+    # daily_health, aur zaroorat ho to owner ko EMAIL (GitHub issue) / Telegram.
+    # Data ko kabhi nahi chhoota; iska fail hona run ka exit code nahi badalta.
+    $Watchdog = "D:\VAJRA SYSTEM GATE\monitor\vajra_watchdog.py"
+    if (Test-Path -LiteralPath $Watchdog) {
+        try {
+            & $PythonExe $Watchdog --after-engine-run *> (Join-Path $LogsRoot "watchdog_$Timestamp.txt")
+        } catch { }
+    }
+    $RunLock.ReleaseMutex()
 }
