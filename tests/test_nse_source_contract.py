@@ -221,3 +221,39 @@ def test_canary_rejects_wrong_date_file_inside_catchup(tmp_path: Path) -> None:
     with pytest.raises(SC.SourceContractError, match="SOURCE_WRONG_DATE"):
         IC._append_missing_raw_sessions(root, sessions=[date(2026, 9, 29)], source_paths={date(2026, 9, 29): z},
                                         snapshot=snap)
+
+
+# ------------------------------------------------------------------------------------------ PIT timeline anchors
+def _list(path: Path, symbols: list[str], series: dict[str, str] | None = None, dummy: bool = False) -> None:
+    rows = [{"Company Name": s, "Industry": "X", "Symbol": s, "Series": (series or {}).get(s, "EQ"),
+             "ISIN Code": f"INE{i:06d}01010"} for i, s in enumerate(symbols)]
+    if dummy:
+        rows.append({"Company Name": "Dummy", "Industry": "X", "Symbol": "DUMMYX", "Series": "EQ",
+                     "ISIN Code": "DUM000000001"})
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def test_dated_daily_official_lists_become_anchors_on_their_own_session(tmp_path: Path) -> None:
+    """29-Sep incident: a 3-day batch catch-up must date the rebalance on the session whose official list first
+    shows it (29-Sep), not on the batch's as_of (1-Oct). Placeholder rows dropped; non-500 lists ignored."""
+    from vajra_regime.nifty500_migration import timeline as TL
+    root = tmp_path
+    monthly = root / "02 Constituent History" / "Official Monthly Snapshots"
+    monthly.mkdir(parents=True)
+    old = [f"S{i:03d}" for i in range(500)]
+    new = old[3:] + ["EMBASSY", "BIRET", "BAGMANE"]
+    pd.DataFrame({"snapshot_date": "2022-03-31", "symbol": old, "source_archive": "m.csv",
+                  "source_archive_sha256": "x"}).to_csv(monthly / "nifty500_official_monthly_members.csv", index=False)
+    daily = root / "01 Raw Source Archives" / "Official Current Constituents"
+    daily.mkdir(parents=True)
+    _list(daily / "2026-09-28_ind_nifty500list.csv", old)
+    _list(daily / "2026-09-29_ind_nifty500list.csv", new, {"EMBASSY": "RR", "BIRET": "RR", "BAGMANE": "RR"}, dummy=True)
+    _list(daily / "2026-09-29_ind_nifty500list_cleaned.csv", new, {"EMBASSY": "RR", "BIRET": "RR", "BAGMANE": "RR"})
+    _list(daily / "2026-09-30_ind_nifty500list.csv", new[:-1])                  # 499 rows -> not an anchor
+    _list(daily / "ind_nifty500list.csv", new, {"EMBASSY": "RR", "BIRET": "RR", "BAGMANE": "RR"})
+    anchors = TL._load_official_anchors(root, as_of=date(2026, 10, 1))
+    assert anchors[date(2026, 9, 28)]["members"] == set(old)
+    assert anchors[date(2026, 9, 29)]["members"] == set(new)                    # official REIT members kept (PIT truth)
+    assert anchors[date(2026, 9, 29)]["source"].endswith("_cleaned.csv")         # placeholder-free variant
+    assert date(2026, 9, 30) not in anchors                                       # not an exact 500 list
+    assert anchors[date(2026, 10, 1)]["source"] == "ind_nifty500list.csv"

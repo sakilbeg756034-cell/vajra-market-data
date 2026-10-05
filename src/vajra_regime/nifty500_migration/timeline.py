@@ -89,6 +89,41 @@ def _load_official_anchors(data_root: Path, *, as_of: date) -> dict[date, dict[s
                 },
             )["members"].add(row["symbol"].strip().upper())
 
+    # 05-Oct-2026: DATED DAILY OFFICIAL LISTS bhi anchor hain (sirf aakhri monthly anchor ke BAAD).
+    # Har roz ka run us session ki official list `<session>_ind_nifty500list[_cleaned].csv` saboot ke roop me
+    # rakhta hai. Pehle sirf "aaj" ki list anchor thi -- isliye 29-Sep..1-Oct ka 3-din batch catch-up NSE ka
+    # 29-Sep wala badlaav (3 REIT + 25 add/remove) 1-Oct par daal deta tha. Ab badlaav usi session par lagta
+    # hai jis session ki official list me wo pehli baar dikha. Placeholder rows (ISIN "IN" se nahi / DUMMY*)
+    # hataye jaate hain, aur sirf exact 500-member list anchor banti hai (warna chhodi + log).
+    daily_dir = data_root / "01 Raw Source Archives" / "Official Current Constituents"
+    last_monthly = max(grouped) if grouped else date.min
+    by_session: dict[date, Path] = {}
+    for path in sorted(daily_dir.glob("20??-??-??_ind_nifty500list*.csv")):
+        try:
+            session = date.fromisoformat(path.name[:10])
+        except ValueError:
+            continue
+        if not (last_monthly < session < as_of):
+            continue
+        if path.name.endswith("_cleaned.csv") or session not in by_session:
+            by_session[session] = path
+    for session, path in sorted(by_session.items()):
+        members: set[str] = set()
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                symbol = str(row.get("Symbol", "")).strip().upper()
+                isin = str(row.get("ISIN Code", "")).strip().upper()
+                if symbol and isin.startswith("IN") and not symbol.startswith("DUMMY"):
+                    members.add(symbol)
+        if len(members) != 500:
+            continue
+        grouped[session] = {
+            "members": members,
+            "source": path.name,
+            "source_sha256": sha256_file(path),
+            "grade": "VERIFIED_OFFICIAL_CURRENT",
+        }
+
     current_path = data_root / "01 Raw Source Archives" / "Official Current Constituents" / "ind_nifty500list.csv"
     current_members: set[str] = set()
     with current_path.open("r", encoding="utf-8-sig", newline="") as handle:
