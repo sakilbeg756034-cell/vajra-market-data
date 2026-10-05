@@ -98,7 +98,7 @@ def check_files():
         (GATE / "START_HERE_AI.md", "poore system ka darwaza"),
         (GATE / "KABHI_DELETE_MAT_KARNA.md", "delete na karne wali list"),
         (LOCK, "locked strategy"),
-        (SHEET_DIR / "VajraMomentumScanner.gs", "sheet ka script"),
+        (SHEET_DIR / "CURRENT" / "VAJRA_MOMENTUM_SCANNER" / "APPS_SCRIPT" / "VajraMomentumScanner.gs.txt", "sheet ka script"),
         (ENGINE / "code/scripts/build_vajra_data.py", "dataset banane ka ek-maatra command"),
         (ENGINE / "code/src/vajra_regime/cloud/signal.py", "cloud signal"),
         (DATA / "MANIFEST.json", "dataset ka manifest"),
@@ -179,7 +179,7 @@ def check_consistency():
 
     sig = (ENGINE / "code/src/vajra_regime/cloud/signal.py").read_text(encoding="utf-8")
     core = (ENGINE / "code/src/vajra_regime/cloud/core.py").read_text(encoding="utf-8")
-    gs = (SHEET_DIR / "VajraMomentumScanner.gs").read_text(encoding="utf-8")
+    gs = (SHEET_DIR / "CURRENT" / "VAJRA_MOMENTUM_SCANNER" / "APPS_SCRIPT" / "VajraMomentumScanner.gs.txt").read_text(encoding="utf-8")
 
     def grab(text, pat):
         m = re.search(pat, text, re.M)
@@ -247,7 +247,7 @@ def check_consistency():
         want = f'{ev["oos_2016_cost_only_pct"]:.2f}'
         docs = {
             "VAJRA_SYSTEM.md": GATE / "VAJRA_SYSTEM.md",
-            "sheet ka README": SHEET_DIR / "VajraMomentumScanner.gs",
+            "sheet ka README": SHEET_DIR / "CURRENT" / "VAJRA_MOMENTUM_SCANNER" / "APPS_SCRIPT" / "VajraMomentumScanner.gs.txt",
         }
         for label, path in docs.items():
             text = path.read_text(encoding="utf-8", errors="replace")
