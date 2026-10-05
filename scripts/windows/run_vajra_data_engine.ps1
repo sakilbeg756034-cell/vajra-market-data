@@ -136,7 +136,9 @@ finally {
     $Watchdog = "D:\VAJRA SYSTEM GATE\monitor\vajra_watchdog.py"
     if (Test-Path -LiteralPath $Watchdog) {
         try {
-            & $PythonExe $Watchdog --after-engine-run *> (Join-Path $LogsRoot "watchdog_$Timestamp.txt")
+            $ErrorActionPreference = "Continue"
+            & $PythonExe $Watchdog --after-engine-run 2>&1 |
+                Out-File -FilePath (Join-Path $LogsRoot "watchdog_$Timestamp.txt") -Encoding utf8
         } catch { }
     }
     $RunLock.ReleaseMutex()
