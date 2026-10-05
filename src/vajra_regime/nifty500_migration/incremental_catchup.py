@@ -33,6 +33,7 @@ from vajra_regime.nifty500_migration.foundation_certification import (
     build_foundation_certification,
 )
 from vajra_regime.nifty500_migration.raw_ohlcv import parse_official_bhavcopy
+from vajra_regime.nifty500_migration import source_contract as SC
 from vajra_regime.nifty500_migration.source_archive import CURRENT_CONSTITUENTS, _download
 from vajra_regime.nifty500_migration.timeline import build_point_in_time_membership
 
@@ -137,6 +138,22 @@ def _refresh_current_snapshot(data_root: Path, *, as_of: date) -> dict[str, Any]
             f"{len(placeholders)} placeholder row(s))"
         )
 
+    # 05-Oct-2026: NAYA SERIES / ASSET TYPE PEHLE PEHCHANO (29-Sep ke 3 REIT ka sabak).
+    # Official list kabhi badli nahi jaati -- ye sirf classification + change report hai. Anjaan series
+    # (na equity, na saabit non-equity) aaye to nayi list ACTIVE nahi hoti aur run fail-closed rukta hai;
+    # dated raw download apni jagah saboot ke roop me pada rehta hai.
+    member_rows = members.astype(str).to_dict(orient="records")
+    classification = SC.classify_official_members(member_rows)
+    prior_rows = (pd.read_csv(active, dtype=str).fillna("").to_dict(orient="records")
+                  if active.exists() else None)
+    diff = SC.membership_diff(prior_rows, member_rows)
+    if classification["unknown"]:
+        raise SC.SourceContractError(
+            "UNKNOWN_CONSTITUENT_SERIES: official Nifty500 list has members with an unclassified series "
+            + ", ".join(f"{m['Symbol']}({m['Series']})" for m in classification["unknown"])
+            + " -- review and add to source_contract.EQUITY_SERIES or NON_EQUITY_SERIES; nothing activated"
+        )
+
     # `active` par HAMESHA 500 hi row jaati hain. Neeche ke saare consumer
     # (timeline, name-map, membership discovery, certification, publish) isi
     # file ko padhte hain, isliye placeholder ko yahin rok dena hi sahi hai --
@@ -176,6 +193,14 @@ def _refresh_current_snapshot(data_root: Path, *, as_of: date) -> dict[str, Any]
         "active_snapshot_sha256": sha256_file(active),
         "prior_active_sha256": prior_hash,
         "membership_changed_since_prior_snapshot": bool(prior_hash and prior_hash != downloaded_hash),
+        "membership_diff": diff,
+        "classification": {
+            "official_members": classification["official"],
+            "equity_eligible": len(classification["equity"]),
+            "non_equity_excluded": len(classification["non_equity"]),
+            "unknown_series": len(classification["unknown"]),
+            "non_equity_members": classification["non_equity"],
+        },
     }
     result["payload_sha256"] = canonical_hash(result)
     atomic_json(data_root / "10 Provenance" / f"current_constituent_snapshot_{as_of}.json", result)
@@ -200,16 +225,44 @@ def _append_missing_raw_sessions(
     existing = pd.read_parquet(raw_path)
     existing["Date"] = pd.to_datetime(existing["Date"]).dt.date
     members = pd.read_csv(snapshot, dtype=str).fillna("")
+    classification = SC.classify_official_members(members.to_dict(orient="records"))
+    if classification["unknown"]:
+        raise SC.SourceContractError(
+            "UNKNOWN_CONSTITUENT_SERIES: " + ", ".join(f"{m['Symbol']}({m['Series']})" for m in classification["unknown"]))
+    non_equity = {m["Symbol"]: m for m in classification["non_equity"]}
     member_map = {
         str(row["Symbol"]).strip().upper(): row for row in members.to_dict(orient="records")
+        if str(row["Symbol"]).strip().upper() not in non_equity
     }
     rows: list[dict[str, Any]] = []
     missing_rows: list[dict[str, str]] = []
+    non_equity_rows: list[dict[str, Any]] = []
+    contract_checks: list[dict[str, Any]] = []
+    coverage: list[dict[str, Any]] = []
     source_manifest: list[dict[str, Any]] = []
+    fingerprint_path = data_root / "11 Logs" / "source_schema_fingerprints.json"
     for session in sessions:
         path = source_paths[session]
         source_hash = sha256_file(path)
+        # PRE-INGEST CANARY: andar ki tareekh, zaroori columns, truncation, duplicate, close > 0.
+        known = SC.load_schema_fingerprint(fingerprint_path, "nse_cm_udiff_bhavcopy")
+        check = SC.check_bhavcopy(path, session, known_headers=known)
+        SC.save_schema_fingerprint(fingerprint_path, "nse_cm_udiff_bhavcopy", check["headers"], check["schema_drift"])
+        contract_checks.append({k: check[k] for k in ("file", "session", "equity_rows", "schema_drift", "status")}
+                               | {"series_counts": {k: v for k, v in check["series_counts"].items()
+                                                    if k in SC.EQUITY_SERIES or k in SC.NON_EQUITY_SERIES}})
         parsed = {row["Symbol"]: row for row in parse_official_bhavcopy(path, session)}
+        if non_equity:
+            facts = SC.raw_series_facts(path, set(non_equity))
+            for symbol, member in sorted(non_equity.items()):
+                fact = facts.get(symbol, {})
+                non_equity_rows.append({
+                    "Date": session.isoformat(), "Symbol": symbol, "ExpectedISIN": member["ISIN"],
+                    "Series": member["Series"], "AssetType": member["AssetType"], "OfficialMember": True,
+                    "VajraEquityEligible": False, "ExclusionReason": member["ExclusionReason"],
+                    "BhavcopySeries": fact.get("Series", ""), "BhavcopyClose": fact.get("Close", ""),
+                    "SourceArchive": path.name,
+                })
         source_manifest.append(
             {
                 "session": session.isoformat(),
@@ -263,6 +316,12 @@ def _append_missing_raw_sessions(
                     ),
                 }
             )
+    for session in sessions:
+        miss = sum(1 for m in missing_rows if m["Date"] == session.isoformat())
+        coverage.append({"session": session.isoformat(), "official_members": classification["official"],
+                         "equity_eligible": len(member_map), "non_equity_excluded": len(non_equity),
+                         "missing_equity_bars": miss, "unknown_series": 0,
+                         "equity_bars_present": len(member_map) - miss})
     new = pd.DataFrame(rows, columns=existing.columns)
     combined = pd.concat(
         [existing.loc[~existing["Date"].isin(sessions)], new], ignore_index=True
@@ -293,6 +352,9 @@ def _append_missing_raw_sessions(
         "appended_sessions": [session.isoformat() for session in sessions],
         "appended_rows": len(rows),
         "new_missing_rows": missing_rows,
+        "non_equity_member_rows": non_equity_rows,
+        "coverage": coverage,
+        "contract_checks": contract_checks,
         "raw_2026_path": str(raw_path),
         "raw_2026_sha256": sha256_file(raw_path),
         "raw_2026_rows": len(combined),
@@ -510,6 +572,54 @@ def _refresh_adjusted_2026(data_root: Path) -> dict[str, Any]:
     return status
 
 
+def _record_non_equity_members(data_root: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Official members outside the VAJRA equity universe (REIT/InvIT): kept as PIT truth, never as equity bars.
+
+    * Existing schema `09 Validation/nifty500_official_raw_missing_member_rows.csv` (official member, no EQ/BE/BZ
+      row) gets one row per member-session with an explicit non-equity Reason -> certification keeps them in the
+      certified membership with OHLCVAvailable = false.
+    * `03 Security Master/nifty500_non_equity_member_registry.csv`: per security, asset type / eligibility / reason /
+      first + last session seen / raw bhavcopy series. Idempotent (re-runs replace the same Date+Symbol).
+    """
+    if not rows:
+        return {"rows": 0, "symbols": []}
+    missing_path = data_root / "09 Validation" / "nifty500_official_raw_missing_member_rows.csv"
+    old = pd.read_csv(missing_path, dtype=str).fillna("") if missing_path.exists() else pd.DataFrame(
+        columns=["Date", "Symbol", "ExpectedISIN", "MembershipConfidence", "Reason", "SourceArchive"])
+    add = pd.DataFrame([{
+        "Date": r["Date"], "Symbol": r["Symbol"], "ExpectedISIN": r["ExpectedISIN"],
+        "MembershipConfidence": "VERIFIED_OFFICIAL_CURRENT",
+        "Reason": f"OFFICIAL_NON_EQUITY_MEMBER_{r['Series']}_{r['AssetType']}_NOT_IN_VAJRA_EQUITY_UNIVERSE",
+        "SourceArchive": r["SourceArchive"]} for r in rows])
+    keys = set(zip(add["Date"], add["Symbol"]))
+    keep = old[[(d, s) not in keys for d, s in zip(old["Date"], old["Symbol"])]] if len(old) else old
+    combined = pd.concat([keep, add], ignore_index=True).sort_values(["Date", "Symbol"])
+    missing_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = missing_path.with_name(f".{missing_path.name}.{uuid4().hex}.partial")
+    combined.to_csv(temporary, index=False, lineterminator="\n")
+    os.replace(temporary, missing_path)
+
+    registry_path = data_root / "03 Security Master" / "nifty500_non_equity_member_registry.csv"
+    frame = pd.DataFrame(rows)
+    prior = pd.read_csv(registry_path, dtype=str).fillna("") if registry_path.exists() else pd.DataFrame()
+    reg = (frame.groupby(["Symbol", "ExpectedISIN", "Series", "AssetType", "ExclusionReason"], as_index=False)
+           .agg(FirstSessionSeen=("Date", "min"), LastSessionSeen=("Date", "max"),
+                BhavcopySeries=("BhavcopySeries", "last")))
+    reg["OfficialMember"] = True
+    reg["VajraEquityEligible"] = False
+    if len(prior):
+        prior = prior[~prior["Symbol"].isin(reg["Symbol"])] if "Symbol" in prior else prior
+        old_first = pd.read_csv(registry_path, dtype=str).set_index("Symbol")["FirstSessionSeen"].to_dict()
+        reg["FirstSessionSeen"] = [min(old_first.get(s, f), f) for s, f in zip(reg["Symbol"], reg["FirstSessionSeen"])]
+        reg = pd.concat([prior, reg.astype(str)], ignore_index=True)
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = registry_path.with_name(f".{registry_path.name}.{uuid4().hex}.partial")
+    reg.sort_values("Symbol").to_csv(temporary, index=False, lineterminator="\n")
+    os.replace(temporary, registry_path)
+    return {"rows": len(rows), "symbols": sorted(frame["Symbol"].unique().tolist()),
+            "missing_rows_path": str(missing_path), "registry_path": str(registry_path)}
+
+
 def run_incremental_catchup(
     *, data_root: Path = DATA_ROOT, today: date | None = None
 ) -> dict[str, Any]:
@@ -541,9 +651,14 @@ def run_incremental_catchup(
         snapshot=Path(snapshot_status["active_snapshot_path"]),
     )
     if incremental["new_missing_rows"]:
+        cov = incremental["coverage"][-1] if incremental["coverage"] else {}
         raise RuntimeError(
-            f"DATA_STALE / INCOMPLETE: {len(incremental['new_missing_rows'])} current-member bars missing"
+            f"DATA_STALE / INCOMPLETE: {len(incremental['new_missing_rows'])} equity-eligible member bars missing "
+            f"(official {cov.get('official_members')}, equity-eligible {cov.get('equity_eligible')}, "
+            f"non-equity excluded {cov.get('non_equity_excluded')}): "
+            + ", ".join(sorted({m['Symbol'] for m in incremental['new_missing_rows']}))
         )
+    non_equity_record = _record_non_equity_members(data_root, incremental["non_equity_member_rows"])
     raw_status = _update_raw_status(data_root, incremental)
     ca_archive = archive_official_corporate_actions(data_root=data_root, as_of=as_of)
     ca_reconciliation = build_corporate_action_reconciliation(data_root=data_root)
@@ -558,6 +673,9 @@ def run_incremental_catchup(
         "sessions_caught_up": [str(value) for value in discovery["expected_sessions"]],
         "session_count": len(discovery["expected_sessions"]),
         "missing_source_sessions": [],
+        "eligible_coverage": incremental["coverage"],
+        "non_equity_members": non_equity_record,
+        "source_contract_checks": incremental["contract_checks"],
         "current_snapshot": snapshot_status,
         "timeline_status": timeline_status["status"],
         "raw_status": raw_status["status"],
