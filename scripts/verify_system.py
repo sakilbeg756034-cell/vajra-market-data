@@ -88,14 +88,10 @@ def head(t):
 def check_files():
     head("1. WO FILE JO HONI HI CHAHIYE")
     must = [
-        (GATE / "VAJRA_SYSTEM.md", "poore system ka naksha"),
-        # 7-Sep-2026: yahan PDF thi. Uske number chaar peedhi purane ho
-        # chuke the (29.59% / 26.82%) aur ye jaanch phir bhi PASS deti
-        # thi -- kyunki ye sirf "file hai ya nahi" dekhti hai, andar kya
-        # likha hai wo nahi. PDF archive me chali gayi; ab uski jagah
-        # Markdown hai, jise check_stale_numbers.py bhi chhaanta hai.
-        (GATE / "VAJRA_STRATEGY_SAMJHAO.md", "strategy aasan bhasha me"),
-        (GATE / "START_HERE_AI.md", "poore system ka darwaza"),
+        # 15-Oct-2026 consolidation: VAJRA_SYSTEM.md + VAJRA_STRATEGY_SAMJHAO.md
+        # docs\history me ARCHIVED; ekmatra master START_HERE_AI.md (+ .txt copy).
+        (GATE / "START_HERE_AI.md", "poore system ka darwaza (ekmatra master)"),
+        (GATE / "START_HERE_AI.txt", "master ki plain-text copy"),
         (GATE / "KABHI_DELETE_MAT_KARNA.md", "delete na karne wali list"),
         (LOCK, "locked strategy"),
         (SHEET_DIR / "CURRENT" / "VAJRA_MOMENTUM_SCANNER" / "APPS_SCRIPT" / "VajraMomentumScanner.gs.txt", "sheet ka script"),
@@ -246,7 +242,7 @@ def check_consistency():
         ev = json.loads(LOCK.read_text(encoding="utf-8"))["evidence"]
         want = f'{ev["oos_2016_cost_only_pct"]:.2f}'
         docs = {
-            "VAJRA_SYSTEM.md": GATE / "VAJRA_SYSTEM.md",
+            "START_HERE_AI.md": GATE / "START_HERE_AI.md",
             "sheet ka README": SHEET_DIR / "CURRENT" / "VAJRA_MOMENTUM_SCANNER" / "APPS_SCRIPT" / "VajraMomentumScanner.gs.txt",
         }
         for label, path in docs.items():
