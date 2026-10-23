@@ -214,6 +214,9 @@ def _number(value: str, *, integer: bool = False) -> float | int | None:
     return int(parsed) if integer else parsed
 
 
+SERIES_PRIORITY = {"EQ": 0, "BE": 1, "BZ": 2}      # same order as raw_ohlcv.py (historical builder)
+
+
 def _append_missing_raw_sessions(
     data_root: Path,
     *,
@@ -236,6 +239,7 @@ def _append_missing_raw_sessions(
     }
     rows: list[dict[str, Any]] = []
     missing_rows: list[dict[str, str]] = []
+    alias_matches: list[dict[str, str]] = []
     non_equity_rows: list[dict[str, Any]] = []
     contract_checks: list[dict[str, Any]] = []
     coverage: list[dict[str, Any]] = []
@@ -251,7 +255,18 @@ def _append_missing_raw_sessions(
         contract_checks.append({k: check[k] for k in ("file", "session", "equity_rows", "schema_drift", "status")}
                                | {"series_counts": {k: v for k, v in check["series_counts"].items()
                                                     if k in SC.EQUITY_SERIES or k in SC.NON_EQUITY_SERIES}})
-        parsed = {row["Symbol"]: row for row in parse_official_bhavcopy(path, session)}
+        parsed_rows = list(parse_official_bhavcopy(path, session))
+        parsed = {row["Symbol"]: row for row in parsed_rows}
+        # SYMBOL BADLA, KAMPANI WAHI (NSE rename, jaise 23-Oct-2026 ICICIPRULI -> ICICILIFE, ISIN INE726G01019).
+        # Index list kuch din purana symbol dikhati hai, bhavcopy naya. Historical builder (raw_ohlcv.py) aise
+        # member ko ISIN se milata hai -- yahan bhi wahi niyam: same ISIN, kisi aur member ka symbol nahi,
+        # series priority EQ > BE > BZ. MembershipSymbol index wala hi rehta hai (timeline se mel), Symbol naya.
+        by_isin: dict[str, list[dict[str, str]]] = {}
+        for row in parsed_rows:
+            row_isin = str(row["ISIN"]).strip().upper()
+            if row_isin:
+                by_isin.setdefault(row_isin, []).append(row)
+        used_exchange = {symbol for symbol in member_map if symbol in parsed}
         if non_equity:
             facts = SC.raw_series_facts(path, set(non_equity))
             for symbol, member in sorted(non_equity.items()):
@@ -273,6 +288,20 @@ def _append_missing_raw_sessions(
         )
         for symbol, member in member_map.items():
             exchange = parsed.get(symbol)
+            alias_match = False
+            if exchange is None:
+                wanted_isin = str(member["ISIN Code"]).strip().upper()
+                choices = [
+                    candidate for candidate in by_isin.get(wanted_isin, [])
+                    if candidate["Symbol"] not in used_exchange and candidate["Symbol"] not in member_map
+                ]
+                if wanted_isin and choices:
+                    exchange = min(choices, key=lambda c: (SERIES_PRIORITY[c["Series"]], c["Symbol"]))
+                    used_exchange.add(exchange["Symbol"])
+                    alias_match = True
+                    alias_matches.append({"Date": session.isoformat(), "MembershipSymbol": symbol,
+                                          "ExchangeSymbol": exchange["Symbol"], "ISIN": wanted_isin,
+                                          "Series": exchange["Series"], "SourceArchive": path.name})
             if exchange is None:
                 missing_rows.append(
                     {
@@ -310,7 +339,9 @@ def _append_missing_raw_sessions(
                     "MembershipEvidence": snapshot.name,
                     "FoundationVersion": FOUNDATION_VERSION,
                     "IdentityStatus": (
-                        "OFFICIAL_BHAVCOPY_ISIN_SYMBOL_MATCH"
+                        "OFFICIAL_BHAVCOPY_ISIN_ALIAS_MATCH"
+                        if alias_match
+                        else "OFFICIAL_BHAVCOPY_ISIN_SYMBOL_MATCH"
                         if expected_isin == exchange_isin
                         else "OFFICIAL_MEMBERSHIP_VS_BHAVCOPY_ISIN_MISMATCH"
                     ),
@@ -352,6 +383,7 @@ def _append_missing_raw_sessions(
         "appended_sessions": [session.isoformat() for session in sessions],
         "appended_rows": len(rows),
         "new_missing_rows": missing_rows,
+        "identity_alias_matches": alias_matches,
         "non_equity_member_rows": non_equity_rows,
         "coverage": coverage,
         "contract_checks": contract_checks,
@@ -674,6 +706,7 @@ def run_incremental_catchup(
         "session_count": len(discovery["expected_sessions"]),
         "missing_source_sessions": [],
         "eligible_coverage": incremental["coverage"],
+        "identity_alias_matches": incremental["identity_alias_matches"],
         "non_equity_members": non_equity_record,
         "source_contract_checks": incremental["contract_checks"],
         "current_snapshot": snapshot_status,

@@ -257,3 +257,52 @@ def test_dated_daily_official_lists_become_anchors_on_their_own_session(tmp_path
     assert anchors[date(2026, 9, 29)]["source"].endswith("_cleaned.csv")         # placeholder-free variant
     assert date(2026, 9, 30) not in anchors                                       # not an exact 500 list
     assert anchors[date(2026, 10, 1)]["source"] == "ind_nifty500list.csv"
+
+
+# ------------------------------------------------------------------------------------------ NSE symbol rename (same ISIN)
+def _rename_case(tmp_path: Path, bhav_extra: list[dict], n_eq: int = 600):
+    members = [{"Company Name": f"C{i}", "Industry": "X", "Symbol": f"STK{i:04d}", "Series": "EQ",
+                "ISIN Code": f"INE{i:06d}01010"} for i in range(600)]
+    members.append({"Company Name": "ICICI Pru Life", "Industry": "Fin", "Symbol": "ICICIPRULI", "Series": "EQ",
+                    "ISIN Code": "INE726G01019"})
+    root, snap = _data_root(tmp_path, members)
+    z = _zip(tmp_path, "BhavCopy_NSE_CM_0_0_0_20261023_F_0000.csv.zip", _rows("2026-10-23", n_eq=n_eq, extra=bhav_extra))
+    out = IC._append_missing_raw_sessions(root, sessions=[date(2026, 10, 23)], source_paths={date(2026, 10, 23): z},
+                                          snapshot=snap)
+    raw = pd.read_parquet(root / "08 Parquet" / "raw" / "year=2026" / "nifty500_raw_daily.parquet")
+    return out, raw
+
+
+RENAMED = {"TradDt": "2026-10-23", "TckrSymb": "ICICILIFE", "SctySrs": "EQ", "ISIN": "INE726G01019",
+           "OpnPric": "430.9", "HghPric": "430.9", "LwPric": "413.4", "ClsPric": "422.2", "PrvsClsgPric": "431",
+           "TtlTradgVol": "1601001", "TtlTrfVal": "670528628.75", "TtlNbOfTxsExctd": "36379"}
+
+
+def test_renamed_symbol_same_isin_is_matched_not_missing(tmp_path: Path) -> None:
+    """23-Oct-2026: index list still says ICICIPRULI, bhavcopy says ICICILIFE (same ISIN) -> bar kept, not DATA_STALE."""
+    out, raw = _rename_case(tmp_path, [RENAMED])
+    assert out["new_missing_rows"] == []
+    assert out["coverage"][0]["missing_equity_bars"] == 0 and out["coverage"][0]["equity_bars_present"] == 601
+    assert out["identity_alias_matches"] == [{"Date": "2026-10-23", "MembershipSymbol": "ICICIPRULI",
+                                              "ExchangeSymbol": "ICICILIFE", "ISIN": "INE726G01019", "Series": "EQ",
+                                              "SourceArchive": "BhavCopy_NSE_CM_0_0_0_20261023_F_0000.csv.zip"}]
+    row = raw[raw["MembershipSymbol"] == "ICICIPRULI"].iloc[0]
+    assert (row["Symbol"], row["ISIN"], row["ExchangeISIN"], row["Close"], row["IdentityStatus"]) == (
+        "ICICILIFE", "INE726G01019", "INE726G01019", 422.2, "OFFICIAL_BHAVCOPY_ISIN_ALIAS_MATCH")
+    normal = raw[raw["MembershipSymbol"] == "STK0001"].iloc[0]
+    assert normal["IdentityStatus"] == "OFFICIAL_BHAVCOPY_ISIN_SYMBOL_MATCH"         # ordinary rows unchanged
+
+
+def test_rename_fallback_never_steals_another_members_bar_and_true_gap_still_fails(tmp_path: Path) -> None:
+    out, _ = _rename_case(tmp_path / "a", [], n_eq=600)
+    assert [m["Symbol"] for m in out["new_missing_rows"]] == ["ICICIPRULI"]          # no ISIN row at all -> missing
+    rows = _rows("2026-10-23", n_eq=600)
+    rows[0]["ISIN"] = "INE726G01019"     # same ISIN, but that row is another current member (STK0000) -> never stolen
+    members = [{"Company Name": f"C{i}", "Industry": "X", "Symbol": f"STK{i:04d}", "Series": "EQ",
+                "ISIN Code": f"INE{i:06d}01010"} for i in range(600)]
+    members.append({"Company Name": "X", "Industry": "Fin", "Symbol": "ICICIPRULI", "Series": "EQ", "ISIN Code": "INE726G01019"})
+    root, snap = _data_root(tmp_path / "b", members)
+    z = _zip(tmp_path / "b", "BhavCopy_NSE_CM_0_0_0_20261023_F_0000.csv.zip", rows)
+    out2 = IC._append_missing_raw_sessions(root, sessions=[date(2026, 10, 23)], source_paths={date(2026, 10, 23): z},
+                                           snapshot=snap)
+    assert [m["Symbol"] for m in out2["new_missing_rows"]] == ["ICICIPRULI"] and out2["identity_alias_matches"] == []
